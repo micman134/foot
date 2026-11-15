@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const http = require('http');
 const fs = require('fs');
@@ -228,6 +227,7 @@ function fdGet(path) {
 }
 
 function getSeason(code) {
+  if (String(code).startsWith('X:')) return Promise.resolve([]); // extra (non football-data) league
   return cached('season:' + code, SEASON_CACHE_MS, async () => {
     const data = await fdGet(`/competitions/${code}/matches?status=FINISHED`);
     return data.matches || [];
@@ -373,6 +373,99 @@ function findOdds(fix, events) {
   return best;
 }
 
+
+// ---------- EXTRA fixtures (leagues football-data.org free plan does NOT cover) ----------
+// Source: ESPN public scoreboard (free, no key, no credits). Odds are added from The Odds API when a league maps to one.
+// Env: EXTRA_FIXTURES=false to switch off | EXTRA_ODDS=false to never spend Odds API credits on them | EXTRA_ODDS_MAX=5 (leagues per refresh)
+// EXTRA_LEAGUES="eng.3:League One,nga.1:NPFL" adds/overrides ESPN league slugs (slug:Name).
+const EXTRA_ON = process.env.EXTRA_FIXTURES !== 'false';
+const EXTRA_ODDS_ON = process.env.EXTRA_ODDS !== 'false';
+const EXTRA_ODDS_MAX = Number(process.env.EXTRA_ODDS_MAX || 5);
+const ESPN_LEAGUES = {
+  'eng.3': 'England League One', 'eng.4': 'England League Two', 'eng.fa': 'FA Cup', 'eng.league_cup': 'EFL Cup',
+  'esp.2': 'Spain Segunda', 'esp.copa_del_rey': 'Copa del Rey', 'ger.2': 'Germany 2. Bundesliga', 'ita.2': 'Italy Serie B',
+  'fra.2': 'France Ligue 2', 'bel.1': 'Belgium Pro League', 'sco.1': 'Scottish Premiership', 'tur.1': 'Turkey Super Lig',
+  'gre.1': 'Greece Super League', 'aut.1': 'Austria Bundesliga', 'sui.1': 'Swiss Super League', 'den.1': 'Denmark Superliga',
+  'nor.1': 'Norway Eliteserien', 'swe.1': 'Sweden Allsvenskan', 'rus.1': 'Russian Premier League',
+  'uefa.europa': 'Europa League', 'uefa.europa.conf': 'Conference League', 'uefa.nations': 'UEFA Nations League',
+  'fifa.friendly': 'International Friendly', 'conmebol.libertadores': 'Copa Libertadores', 'conmebol.sudamericana': 'Copa Sudamericana',
+  'arg.1': 'Argentina Liga', 'usa.1': 'MLS', 'mex.1': 'Liga MX', 'jpn.1': 'J1 League', 'chn.1': 'Chinese Super League',
+  'aus.1': 'A-League', 'ksa.1': 'Saudi Pro League', 'caf.champions': 'CAF Champions League', 'caf.confed': 'CAF Confederation Cup',
+  'concacaf.champions': 'CONCACAF Champions Cup', 'rsa.1': 'South Africa PSL', 'egy.1': 'Egypt Premier League',
+  // already covered by football-data but harmless: duplicates are removed below, and they back it up when football-data is slow
+  'eng.1': 'Premier League', 'eng.2': 'Championship', 'esp.1': 'La Liga', 'ger.1': 'Bundesliga', 'ita.1': 'Serie A',
+  'fra.1': 'Ligue 1', 'ned.1': 'Eredivisie', 'por.1': 'Primeira Liga', 'bra.1': 'Brasileirao', 'uefa.champions': 'Champions League',
+};
+for (const part of (process.env.EXTRA_LEAGUES || '').split(',')) {
+  const [slug, ...nm] = part.split(':'); if (slug && slug.trim()) ESPN_LEAGUES[slug.trim()] = nm.join(':').trim() || slug.trim();
+}
+// ESPN slug -> The Odds API sport key (only used to attach odds)
+const ESPN_TO_ODDS = {
+  'eng.3': 'soccer_england_league1', 'eng.4': 'soccer_england_league2', 'esp.2': 'soccer_spain_segunda_division',
+  'ger.2': 'soccer_germany_bundesliga2', 'ita.2': 'soccer_italy_serie_b', 'fra.2': 'soccer_france_ligue_two',
+  'bel.1': 'soccer_belgium_first_div', 'sco.1': 'soccer_spl', 'tur.1': 'soccer_turkey_super_league', 'gre.1': 'soccer_greece_super_league',
+  'aut.1': 'soccer_austria_bundesliga', 'sui.1': 'soccer_switzerland_superleague', 'den.1': 'soccer_denmark_superliga',
+  'nor.1': 'soccer_norway_eliteserien', 'swe.1': 'soccer_sweden_allsvenskan', 'uefa.europa': 'soccer_uefa_europa_league',
+  'uefa.europa.conf': 'soccer_uefa_europa_conference_league', 'conmebol.libertadores': 'soccer_conmebol_copa_libertadores',
+  'arg.1': 'soccer_argentina_primera_division', 'usa.1': 'soccer_usa_mls', 'mex.1': 'soccer_mexico_ligamx',
+  'jpn.1': 'soccer_japan_j_league', 'chn.1': 'soccer_china_superleague', 'aus.1': 'soccer_australia_aleague',
+  'eng.fa': 'soccer_fa_cup', 'eng.league_cup': 'soccer_efl_cup',
+};
+const ymd = (ms) => new Date(ms).toISOString().slice(0, 10).replace(/-/g, '');
+const extraIdOf = (espnId) => { // numeric + far above football-data ids so buttons/DB (BIGINT, \d+) keep working
+  const n = Number(espnId);
+  if (Number.isFinite(n) && n > 0) return 9e12 + n;
+  return 9e12 + parseInt(crypto.createHash('md5').update(String(espnId)).digest('hex').slice(0, 8), 16);
+};
+async function espnLeague(slug, today) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard?limit=100&dates=${ymd(Date.now() - 864e5)}-${ymd(Date.now() + 864e5)}`;
+  try {
+    const res = await fetchRetry(url, {}, 15000, 2);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const out = [];
+    for (const ev of data.events || []) {
+      const st = ev.status && ev.status.type && ev.status.type.state;
+      if (st && st !== 'pre') continue; // only matches that have not started
+      const utc = new Date(ev.date).getTime();
+      if (!Number.isFinite(utc) || localDate(new Date(utc)) !== today) continue;
+      const comp = (ev.competitions || [])[0];
+      const h = comp && (comp.competitors || []).find((c) => c.homeAway === 'home');
+      const a = comp && (comp.competitors || []).find((c) => c.homeAway === 'away');
+      if (!h || !a || !h.team || !a.team) continue;
+      out.push({
+        id: extraIdOf(ev.id), comp: 'X:' + slug, compName: ESPN_LEAGUES[slug] || slug, slug, extra: true,
+        home: h.team.shortDisplayName || h.team.displayName, away: a.team.shortDisplayName || a.team.displayName,
+        homeFull: h.team.displayName || h.team.shortDisplayName, awayFull: a.team.displayName || a.team.shortDisplayName,
+        homeId: null, awayId: null, utc, odds: null,
+      });
+    }
+    return out;
+  } catch (e) { return []; }
+}
+async function getExtraFixtures(today, existing) {
+  if (!EXTRA_ON) return [];
+  const slugs = Object.keys(ESPN_LEAGUES);
+  const lists = await pool(slugs, 5, (slug) => espnLeague(slug, today));
+  let extras = lists.flat();
+  // drop anything football-data already gave us (same teams, kickoff within 3h)
+  const same = (a, b) => Math.abs(a.utc - b.utc) < 3 * 3600e3 && nameScore(a.homeFull, b.homeFull) >= 0.99 && nameScore(a.awayFull, b.awayFull) >= 0.99;
+  const seen = [];
+  extras = extras.filter((x) => { if (existing.some((f) => same(x, f)) || seen.some((f) => same(x, f))) return false; seen.push(x); return true; });
+  // odds (bonus): only leagues that really play today, capped to protect your Odds API credits
+  if (ODDS_KEY && EXTRA_ODDS_ON) {
+    const slugsToday = [...new Set(extras.map((x) => x.slug))].filter((sl) => ESPN_TO_ODDS[sl]).slice(0, EXTRA_ODDS_MAX);
+    for (const sl of slugsToday) {
+      try {
+        const events = await cached('odds:' + ESPN_TO_ODDS[sl], CACHE_MS, () => fetchOdds(ESPN_TO_ODDS[sl]));
+        for (const f of extras.filter((x) => x.slug === sl)) f.odds = findOdds({ home: f.homeFull, away: f.awayFull, utc: f.utc }, events);
+      } catch (e) { console.log('Extra odds failed for', sl, e.message); }
+    }
+  }
+  console.log(`Extra fixtures today: ${extras.length} (${extras.filter((x) => x.odds).length} with odds)`);
+  return extras;
+}
+
 // ---------- Today's matches ----------
 let nextInfo = null; // next match day after today (shown when today is empty)
 function getMatchesToday() {
@@ -425,6 +518,7 @@ function getMatchesTodayCached(key) {
         console.log('Odds fetch failed for', c, e.message);
       }
     }
+    try { fixtures.push(...(await getExtraFixtures(today, fixtures))); } catch (e) { console.log('Extra fixtures failed', e.message); }
     fixtures.sort((a, b) => a.compName.localeCompare(b.compName) || a.utc - b.utc);
     return fixtures;
   });
@@ -755,6 +849,7 @@ function statAnalysis(m) {
 // One AI call per match, shared by /top5, /best3 and the detail view; concurrent requests are de-duplicated.
 const aiInflight = new Map();
 function aiRefine(m, st) {
+  if (m.extra && !m.odds) return Promise.resolve(st); // nothing real to base an AI guess on
   const key = 'ai:' + m.id;
   const c = cache.get(key);
   if (c && c.exp > Date.now()) return Promise.resolve(c.val);
@@ -1566,7 +1661,7 @@ function noteCredits(res) {
 const FORM_EMOJI = { W: '✅', D: '🟨', L: '❌' };
 const formStrip = (s) => (s && s.form && s.form !== 'n/a' ? s.form.split(' ').map((x) => FORM_EMOJI[x] || x).join('') : 'n/a');
 const userLeagues = (u) => (u && Array.isArray(u.leagues) ? u.leagues : []);
-const byLeague = (arr, u) => { const lg = userLeagues(u); return lg.length ? arr.filter((x) => lg.includes(x.m.comp)) : arr; };
+const byLeague = (arr, u) => { const lg = userLeagues(u); return lg.length ? arr.filter((x) => lg.includes(x.m.comp) || x.m.extra) : arr; };
 function applyPrefs(arr, u) { // league filter + minimum pick odds for Top 5 / Best 3
   let out = byLeague(arr, u);
   const mo = u && Number(u.min_odds) > 0 ? Number(u.min_odds) : 0;
@@ -1594,7 +1689,7 @@ function stakeTxt(u, p, o) {
 async function renderPage(page, u) {
   const all = await getMatchesToday();
   const lg = userLeagues(u);
-  const list = lg.length ? all.filter((m) => lg.includes(m.comp)) : all;
+  const list = lg.length ? all.filter((m) => lg.includes(m.comp) || m.extra) : all;
   if (!list.length) return {
     text: all.length
       ? '😴 No matches today in your selected leagues. Change them in /settings.'
@@ -1945,6 +2040,7 @@ function getH2H(id) {
   return cached('h2h:' + id, 12 * 3600e3, async () => fdGet(`/matches/${id}/head2head?limit=8`));
 }
 async function renderH2H(m, u) {
+  if (m.extra) return '🔁 No head-to-head data available for this match (it is outside the main data plan).';
   try {
     const d = await getH2H(m.id);
     const ms = (d.matches || []).filter((x) => x.score && x.score.fullTime && x.score.fullTime.home != null).slice(0, 8);
