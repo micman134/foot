@@ -1149,21 +1149,26 @@ const best3Score = (m, st) => pickScore(m, st, BEST3_MIN_CONF);
 async function computeBest3Raw() {
   const now = Date.now();
   const matches = (await getMatchesToday()).filter((m) => m.odds && m.utc > now);
-  const eligible = [];
+  const pool0 = [];
   let skipped = 0;
   for (const m of matches) {
     const d = await deepAnalysis(m);
     const big = whyPopular(m.home, m.homeFull, d.hp, d.table) || whyPopular(m.away, m.awayFull, d.ap, d.table);
     if (big) { skipped++; continue; }                                       // top-table / popular club involved → never used
-    if (d.hp.n < MIN_BEST3_GAMES || d.ap.n < MIN_BEST3_GAMES) continue;      // too little data to trust
-    eligible.push({ m, st: d });
+    pool0.push({ m, st: d, thin: d.hp.n < MIN_BEST3_GAMES || d.ap.n < MIN_BEST3_GAMES });
   }
+  // Tiers keep Best 3 filled every day: 0 = enough form data + confidence >= minimum, 1 = thin data (judged mostly on bookmaker odds),
+  // 2 = confidence below the minimum. Better tiers always come first; the list only dips into a lower tier when it has to.
   const rank = (arr) =>
-    arr.map((x) => ({ ...x, sc: best3Score(x.m, x.st) })).filter((x) => x.sc).sort((a, b) => b.sc.score - a.sc.score);
+    arr.map((x) => {
+      const sc = pickScore(x.m, x.st, 0);
+      if (!sc) return null;
+      return { ...x, sc, tier: sc.pick.p < BEST3_MIN_CONF ? 2 : x.thin ? 1 : 0 };
+    }).filter(Boolean).sort((a, b) => a.tier - b.tier || b.sc.score - a.sc.score);
 
-  const cands = rank(eligible).slice(0, MAX_AI_MATCHES);
-  const refined = await pool(cands, AI_CONCURRENCY, async (x) => ({ m: x.m, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
-  eligible.forEach((x) => logPrediction(x.m, x.st));
+  const cands = rank(pool0).slice(0, MAX_AI_MATCHES);
+  const refined = await pool(cands, AI_CONCURRENCY, async (x) => ({ m: x.m, thin: x.thin, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
+  pool0.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const list = rank(refined).slice(0, 3);
   list.forEach((x) => logPrediction(x.m, x.st, 'best3'));
@@ -1943,34 +1948,41 @@ async function renderTop5(u, { full = true } = {}) {
   return { text: tx + t(u, 'disc'), kb, empty: false };
 }
 
-async function renderBest3(u, { full = true } = {}) {
+async function renderBest3(u, { full = true, only1 = false } = {}) {
   const b3 = await computeBest3();
   const { skipped, considered } = b3;
   const all = b3.list.filter((x) => x.m.utc > Date.now());
   const list = applyPrefs(all, u);
   const rule = `no top-${TOP_RANK_EXCLUDE} table teams, no big-name clubs`;
   if (!list.length)
-    return { text: all.length ? t(u, 'none_prefs') : `😴 No qualifying under-the-radar matches today (${skipped} of ${considered} matches skipped because a top/popular club plays). Try /top5.\n\n` + t(u, 'disc'), kb: null, empty: true };
-  const shown = full ? list : list.slice(0, FREE_PICKS);
-  let tx = `💎 <b>${t(u, 'best3_head')}</b>\n<i>${rule}. Ranked by confidence, source agreement and value vs the market.</i>\n`;
-  if (list.length < 3) tx += `<i>Only ${list.length} match${list.length > 1 ? 'es' : ''} qualified today.</i>\n`;
-  tx += '\n';
-  shown.forEach(({ m, st, sc }, i) => {
+    return { text: all.length ? t(u, 'none_prefs') : `😴 No under-the-radar match with usable odds right now (${considered} with odds, ${skipped} skipped because a top/popular club plays). Odds for later kickoffs usually appear closer to match time, so try again a bit later, or use /top5.\n\n` + t(u, 'disc'), kb: null, empty: true };
+  const shown = only1 ? list.slice(0, 1) : full ? list : list.slice(0, FREE_PICKS);
+  let tx = only1
+    ? `🥇 <b>Best pick of the day</b>\n<i>The most likely result among under-the-radar matches (${rule}).</i>\n\n`
+    : `💎 <b>${t(u, 'best3_head')}</b>\n<i>${rule}. Ranked by confidence, source agreement and value vs the market. 🥇 = best pick of the day.</i>\n`;
+  if (!only1) {
+    if (list.length < 3) tx += `<i>Only ${list.length} match${list.length > 1 ? 'es' : ''} had usable odds today.</i>\n`;
+    tx += '\n';
+  }
+  const medal = ['🥇', '🥈', '🥉'];
+  shown.forEach(({ m, st, sc, tier }, i) => {
     const p = sc.pick;
     const k = p.k;
-    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += `${medal[i] || i + 1 + '.'} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
     tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · confidence ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
     tx += `   📊 Market ${pct(m.odds.probs[k])}%` + (st.form ? ` · Form model ${pct(st.form[k])}%` : '') + (st.ai ? ` · AI ${pct(st.ai.probs[k])}%` : '') + '\n';
     const tl = (name, pr) =>
       `${esc(name)} #${pr.rank || '?'}` + (pr.venue.n ? ` (${f1(pr.venue.ppg)} pts/g ${pr === st.hp ? 'home' : 'away'}, ${f1(pr.venue.gf)}-${f1(pr.venue.ga)} goals/g)` : '');
-    tx += `   📈 ${tl(m.home, st.hp)} | ${tl(m.away, st.ap)}\n`;
+    if (st.hp.rank || st.ap.rank || st.hp.venue.n || st.ap.venue.n) tx += `   📈 ${tl(m.home, st.hp)} | ${tl(m.away, st.ap)}\n`;
     if (st.mk) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
+    if (tier === 1) tx += `   ⚠️ <i>Little form data for this league, so this leans mostly on bookmaker odds.</i>\n`;
+    if (tier === 2) tx += `   ⚠️ <i>Lower-confidence pick: few safe options today.</i>\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
     tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
   });
   let kb = null;
-  if (shown.length < list.length) { tx += `🔒 ${t(u, 'locked_more', list.length - shown.length)}\n\n`; kb = upgradeKb(u); }
+  if (!only1 && shown.length < list.length) { tx += `🔒 ${t(u, 'locked_more', list.length - shown.length)}\n\n`; kb = upgradeKb(u); }
   return { text: tx + t(u, 'disc'), kb, empty: false };
 }
 
@@ -2496,16 +2508,19 @@ const picksHandler = (kind) => async (ctx) => {
   const wait = await ctx.reply(t(ctx.u, kind === 'top5' ? 'wait_top5' : 'wait_best3'));
   try {
     await ctx.sendChatAction('typing');
-    const r = await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: ctx.premium });
+    const r = await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: ctx.premium, only1: kind === 'best1' });
     await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
-    const other = kind === 'top5' ? Markup.button.callback('💎 Best 3', 'best3') : Markup.button.callback('🏆 Top 5', 'top5');
-    await replyLong(ctx, r.text, withNav(r.kb, [[other, Markup.button.callback('⚽ Today', 'today')]]));
+    const B = { top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1' };
+    const others = Object.keys(B).filter((x) => x !== kind).map((x) => Markup.button.callback(B[x], x));
+    await replyLong(ctx, r.text, withNav(r.kb, [others, [Markup.button.callback('⚽ Today', 'today')]]));
   } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
 };
 bot.command('top5', detach(picksHandler('top5')));
 bot.command('best3', detach(picksHandler('best3')));
 bot.action('top5', async (ctx) => { await ctx.answerCbQuery(); picksHandler('top5')(ctx).catch(console.error); });
 bot.action('best3', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best3')(ctx).catch(console.error); });
+bot.command('best1', detach(picksHandler('best1')));
+bot.action('best1', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best1')(ctx).catch(console.error); });
 
 // premium-only analysis tools
 const toolHandler = (render, again) => async (ctx) => {
@@ -2830,6 +2845,7 @@ const PUBLIC_COMMANDS = [
   { command: 'today', description: "Today's matches with odds" },
   { command: 'top5', description: 'Top 5 picks of the day' },
   { command: 'best3', description: 'Best 3 under-the-radar picks' },
+  { command: 'best1', description: 'Best single pick of the day' },
   { command: 'value', description: 'Value bets (Premium)' },
   { command: 'acca', description: 'Accumulator builder (Premium)' },
   { command: 'goals', description: 'Goals markets (Premium)' },
