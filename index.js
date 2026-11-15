@@ -93,11 +93,11 @@ const TZ = process.env.TIMEZONE || 'Africa/Lagos';
 const CACHE_MS = Number(process.env.CACHE_MINUTES || 180) * 60 * 1000;
 const SEASON_CACHE_MS = 6 * 60 * 60 * 1000;
 const MIN_PICK_ODDS = Number(process.env.MIN_PICK_ODDS || 1.15); // skip "pointless" 1.05 favourites in Top 5
-const MAX_AI_MATCHES = Number(process.env.MAX_AI_MATCHES || 10); // how many top candidates get an LLM opinion
+const MAX_AI_MATCHES = Number(process.env.MAX_AI_MATCHES || 40); // how many top candidates get an LLM opinion
 // ----- Model tuning -----
 const W_MKT = Number(process.env.W_MARKET || 0.62);  // market odds are the strongest single signal
 const W_FORM = Number(process.env.W_FORM || 0.30);   // team-rating Poisson model
-const W_AI = Number(process.env.W_AI || 0.08);       // small LLMs are weak at probabilities -> low weight
+const W_AI = Number(process.env.W_AI || 0.15);       // small LLMs are weak at probabilities -> low weight
 const AI_MAX_DEV = Number(process.env.AI_MAX_DEV || 0.08); // LLM may move each outcome at most +-8 pts away from the market
 const FORM_HALF_LIFE_DAYS = Number(process.env.FORM_HALF_LIFE_DAYS || 75); // older results count less
 const DC_RHO = Number(process.env.DC_RHO || -0.1);   // Dixon-Coles low-score correction
@@ -462,7 +462,7 @@ async function espnLeague(slug, today) {
         id, comp: 'X:' + slug, compName: ESPN_LEAGUES[slug] || slug, slug, extra: true,
         home: h.team.shortDisplayName || h.team.displayName, away: a.team.shortDisplayName || a.team.displayName,
         homeFull: h.team.displayName || h.team.shortDisplayName, awayFull: a.team.displayName || a.team.shortDisplayName,
-        homeId: null, awayId: null, utc, odds: null,
+        homeId: null, awayId: null, espnHomeId: h.team.id, espnAwayId: a.team.id, utc, odds: null,
       });
     }
   }
@@ -496,6 +496,58 @@ async function sportsDbDay(dateStr, today) {
     return out;
   } catch (e) { extraDiag.sdbErr = (e.cause && e.cause.code) || e.message; return []; }
 }
+// ---------- Previous matches for extra-league teams (ESPN team schedule) ----------
+const espnTeamFail = new Map();
+async function espnTeamGames(slug, teamId) {
+  if (!slug || !teamId) return [];
+  const key = 'espnteam:' + slug + ':' + teamId;
+  if ((espnTeamFail.get(key) || 0) > Date.now()) return [];
+  try {
+    return await cached(key, 12 * 3600e3, async () => {
+      const res = await fetchRetry(`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${teamId}/schedule`, { headers: FEED_HEADERS }, 12000, 2);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const games = [];
+      for (const ev of data.events || []) {
+        const comp = (ev.competitions || [])[0];
+        if (!comp) continue;
+        const stt = ((comp.status || ev.status || {}).type) || {};
+        if (!(stt.completed === true || stt.state === 'post')) continue;
+        const me = (comp.competitors || []).find((c) => String((c.team && c.team.id) || c.id) === String(teamId));
+        const other = (comp.competitors || []).find((c) => c !== me);
+        if (!me || !other) continue;
+        const sc = (c) => Number(c.score && typeof c.score === 'object' ? (c.score.value != null ? c.score.value : c.score.displayValue) : c.score);
+        const gf = sc(me), ga = sc(other);
+        if (!Number.isFinite(gf) || !Number.isFinite(ga)) continue;
+        games.push({ date: ev.date || comp.date, home: me.homeAway === 'home', gf, ga, opp: (other.team && (other.team.shortDisplayName || other.team.displayName)) || 'opponent' });
+      }
+      return games.sort((a, b) => new Date(b.date) - new Date(a.date));
+    });
+  } catch (e) {
+    espnTeamFail.set(key, Date.now() + 30 * 60e3);
+    console.log('Team history unavailable', slug, teamId, '-', e.message);
+    return [];
+  }
+}
+// Same shape as statAnalysis, built from each team's previous matches (no football-data season needed)
+async function extraAnalysis(m) {
+  const [hg, ag] = await Promise.all([espnTeamGames(m.slug, m.espnHomeId), espnTeamGames(m.slug, m.espnAwayId)]);
+  let form = null;
+  if (hg.length >= 3 && ag.length >= 3) {
+    const avg = (arr, k) => arr.reduce((x, g) => x + g[k], 0) / arr.length;
+    const L = (arr) => arr.slice(0, 10);
+    const clampG = (x) => Math.max(0.3, Math.min(3.5, x));
+    const lh = clampG(1.08 * (avg(L(hg), 'gf') + avg(L(ag), 'ga')) / 2);
+    const la = clampG(0.93 * (avg(L(ag), 'gf') + avg(L(hg), 'ga')) / 2);
+    form = { ...poisson1x2(lh, la), lh, la, rel: 0.6 * Math.min(1, Math.min(hg.length, ag.length) / 8) };
+  }
+  const h2h = hg.filter((g) => nameScore(g.opp, m.awayFull) >= 0.99).slice(0, 3)
+    .map((g) => (g.home ? `${m.home} ${g.gf}-${g.ga} ${g.opp}` : `${g.opp} ${g.ga}-${g.gf} ${m.home}`) + ` (${fmtDate(g.date)})`);
+  const mkt = m.odds ? m.odds.probs : null;
+  const disagree = mkt && form ? 0.5 * ['H', 'D', 'A'].reduce((x, k) => x + Math.abs(mkt[k] - form[k]), 0) : null;
+  return { hs: summarise(hg), as: summarise(ag), histH: hg.slice(0, 8), histA: ag.slice(0, 8), form, h2h, mkt, disagree, final: blend(mkt, form, null), ai: null };
+}
+
 // Third source: The Odds API "events" lists (free, no credits used) - covers every in-season soccer competition it prices.
 async function oddsApiEventsDay(today) {
   if (!ODDS_KEY) return [];
@@ -832,13 +884,22 @@ async function hfPredict(m, st) {
   await discoveryDone;
   const line = (name, s) =>
     `${name}: last5 ${s.form} (${s.ppg == null ? 'n/a' : s.ppg.toFixed(1)} pts/game, ${s.gf} scored, ${s.ga} conceded); recent: ${s.recent.join(', ') || 'n/a'}`;
+  const gTxt = (g) => `${g.home ? 'home' : 'away'} vs ${g.opp} ${g.gf}-${g.ga} (${fmtDate(g.date)})`;
+  const hist = (name, arr, s, isHome) => {
+    if (!arr || !arr.length) return line(name, s);
+    const w = arr.filter((g) => g.gf > g.ga).length, d = arr.filter((g) => g.gf === g.ga).length, l = arr.length - w - d;
+    const gf = arr.reduce((x, g) => x + g.gf, 0) / arr.length, ga = arr.reduce((x, g) => x + g.ga, 0) / arr.length;
+    const v = arr.filter((g) => g.home === isHome);
+    const vt = v.length ? ` ${isHome ? 'At home' : 'Away'}: ${v.filter((g) => g.gf > g.ga).length}W ${v.filter((g) => g.gf === g.ga).length}D ${v.filter((g) => g.gf < g.ga).length}L in ${v.length}.` : '';
+    return `${name} previous ${arr.length} matches (newest first): ${arr.map(gTxt).join('; ')}. Record ${w}W ${d}D ${l}L, average ${gf.toFixed(1)} scored / ${ga.toFixed(1)} conceded.${vt}`;
+  };
   const prompt = [
     `Match: ${m.homeFull} (home) vs ${m.awayFull} (away) — ${m.compName}`,
     m.odds
       ? `Bookmaker average odds: home ${m.odds.odds.H.toFixed(2)}, draw ${m.odds.odds.D.toFixed(2)}, away ${m.odds.odds.A.toFixed(2)}. Margin-free market chances: home ${pct(m.odds.probs.H)}%, draw ${pct(m.odds.probs.D)}%, away ${pct(m.odds.probs.A)}%.`
       : 'No odds available.',
-    line(m.homeFull, st.hs),
-    line(m.awayFull, st.as),
+    hist(m.homeFull, st.histH, st.hs, true),
+    hist(m.awayFull, st.histA, st.as, false),
     st.form ? `Statistical goal model expects ${st.form.lh.toFixed(2)}-${st.form.la.toFixed(2)} goals.` : '',
     st.h2h.length ? `Head-to-head this season: ${st.h2h.join('; ')}` : '',
     st.extra || '',
@@ -857,7 +918,7 @@ async function hfPredict(m, st) {
             max_tokens: 250,
             temperature: 0.2,
             messages: [
-              { role: 'system', content: 'You are a careful football analyst. Use only the data provided. Never invent injuries, lineups or news. Reply with JSON only.' },
+              { role: 'system', content: 'You are a careful football analyst. Base your estimate mainly on the previous matches of both teams given below (recent results, goals scored and conceded, home/away record, opponents faced) and compare it with the bookmaker prices. Use only the data provided. Never invent injuries, lineups or news. Reply with JSON only.' },
               { role: 'user', content: prompt },
             ],
           }),
@@ -915,6 +976,7 @@ async function hfPredict(m, st) {
 // ---------- Analysis pipeline ----------
 function statAnalysis(m) {
   return cached('stat:' + m.id, CACHE_MS, async () => {
+    if (m.extra) return extraAnalysis(m);
     let season = [];
     try {
       season = await getSeason(m.comp);
@@ -938,14 +1000,14 @@ function statAnalysis(m) {
       .slice(0, 3);
     const mkt = m.odds ? m.odds.probs : null;
     const disagree = mkt && form ? 0.5 * ['H', 'D', 'A'].reduce((s, k) => s + Math.abs(mkt[k] - form[k]), 0) : null; // total-variation distance model vs market
-    return { hs: summarise(hg), as: summarise(ag), form, h2h, mkt, disagree, final: blend(mkt, form, null), ai: null };
+    return { hs: summarise(hg), as: summarise(ag), histH: hg.slice(0, 8), histA: ag.slice(0, 8), form, h2h, mkt, disagree, final: blend(mkt, form, null), ai: null };
   });
 }
 
 // One AI call per match, shared by /top5, /best3 and the detail view; concurrent requests are de-duplicated.
 const aiInflight = new Map();
 function aiRefine(m, st) {
-  if (m.extra && !m.odds) return Promise.resolve(st); // nothing real to base an AI guess on
+  if (m.extra && !m.odds && !(st.hs && st.hs.games >= 3)) return Promise.resolve(st); // nothing real to base an AI guess on
   const key = 'ai:' + m.id;
   const c = cache.get(key);
   if (c && c.exp > Date.now()) return Promise.resolve(c.val);
@@ -1155,7 +1217,7 @@ async function computeBest3Raw() {
     const d = await deepAnalysis(m);
     const big = whyPopular(m.home, m.homeFull, d.hp, d.table) || whyPopular(m.away, m.awayFull, d.ap, d.table);
     if (big) { skipped++; continue; }                                       // top-table / popular club involved → never used
-    pool0.push({ m, st: d, thin: d.hp.n < MIN_BEST3_GAMES || d.ap.n < MIN_BEST3_GAMES });
+    pool0.push({ m, st: d, thin: Math.max(d.hp.n, d.hs.games || 0) < MIN_BEST3_GAMES || Math.max(d.ap.n, d.as.games || 0) < MIN_BEST3_GAMES });
   }
   // Tiers keep Best 3 filled every day: 0 = enough form data + confidence >= minimum, 1 = thin data (judged mostly on bookmaker odds),
   // 2 = confidence below the minimum. Better tiers always come first; the list only dips into a lower tier when it has to.
@@ -1429,7 +1491,7 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map((x) => Number(x.t
 const isAdminId = (id) => ADMIN_IDS.includes(Number(id));
 const PAYSTACK_KEY = process.env.PAYSTACK_SECRET_KEY || '';
 const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
-const PAYSTACK_EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || 'example.com'; // Telegram gives no email; Paystack needs one
+const PAYSTACK_EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || 'footballprediction.com'; // Telegram gives no email; Paystack needs one
 const STARS_ON = process.env.STARS !== 'off';
 const PLANS = {
   week: { label: 'Weekly', days: 7, ngn: Number(process.env.PRICE_WEEK_NGN || 1500), stars: Number(process.env.STARS_WEEK || 100) },
@@ -1479,6 +1541,16 @@ async function initDb() {
 // ---------- Small utils ----------
 const money = (n) => Number(n).toLocaleString('en-NG', { maximumFractionDigits: 0 });
 const peek = (key) => { const c = cache.get(key); return c && c.exp > Date.now() ? c.val : null; };
+function refineAll() { // AI opinion for EVERY upcoming match of the day; cached and shared by Top 5 / Best 3 / Value / Acca / Goals / DC
+  return cached('refineall:' + localDate(new Date()), CACHE_MS, async () => {
+    if (!AI_ON) return true;
+    const ms = (await getMatchesToday()).filter((m) => m.utc > Date.now());
+    let ok = 0;
+    await pool(ms, AI_CONCURRENCY, async (m) => { try { const r = await aiRefine(m, await deepAnalysis(m)); if (r && r.ai) ok++; } catch (e) {} });
+    if (ms.length && !ok) throw new Error('AI unavailable'); // not cached -> retried on the next request
+    return true;
+  });
+}
 const bestKnown = (m, d) => peek('ai:' + m.id) || d; // use the AI-refined analysis when it already exists
 const argText = (ctx) => ((ctx.message && ctx.message.text) || '').replace(/^\/\S+\s*/, '').trim();
 function splitMsg(text, max = 3900) {
@@ -1989,6 +2061,7 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
 // ----- Value bets: model probability vs the BEST bookmaker price -----
 function computeValue() {
   return cached('value:' + localDate(new Date()), CACHE_MS, async () => {
+    await refineAll().catch(() => {});
     const now = Date.now();
     const matches = (await getMatchesToday()).filter((m) => m.odds && m.odds.best && m.utc > now);
     const out = [];
@@ -2024,6 +2097,7 @@ async function renderValue(u) {
 
 // ----- Accumulator builder -----
 async function accaPool() {
+  await refineAll().catch(() => {});
   const now = Date.now();
   const matches = (await getMatchesToday()).filter((m) => m.odds && m.utc > now);
   const out = [];
@@ -2064,6 +2138,7 @@ async function renderAcca(u, mode = 'balanced', legsN = 3) {
 
 // ----- Goals markets & safer markets (from the goal model) -----
 async function analysedToday() {
+  await refineAll().catch(() => {});
   const now = Date.now();
   const out = [];
   for (const m of (await getMatchesToday()).filter((x) => x.utc > now)) {
