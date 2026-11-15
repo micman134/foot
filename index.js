@@ -1494,8 +1494,8 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL ||
 const PAYSTACK_EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || 'footballprediction.com'; // Telegram gives no email; Paystack needs one
 const STARS_ON = process.env.STARS !== 'off';
 const PLANS = {
-  week: { label: 'Weekly', days: 7, ngn: Number(process.env.PRICE_WEEK_NGN || 1500), stars: Number(process.env.STARS_WEEK || 100) },
-  month: { label: 'Monthly', days: 30, ngn: Number(process.env.PRICE_MONTH_NGN || 4500), stars: Number(process.env.STARS_MONTH || 350) },
+  week: { label: 'Weekly', days: 7, ngn: Number(process.env.PRICE_WEEK_NGN || 2000), stars: Number(process.env.STARS_WEEK || 100) },
+  month: { label: 'Monthly', days: 30, ngn: Number(process.env.PRICE_MONTH_NGN || 6000), stars: Number(process.env.STARS_MONTH || 350) },
 };
 const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 3);   // free users: match analyses / predictions per day
 const FREE_PICKS = Number(process.env.FREE_PICKS || 1);               // free users see this many Top 5 / Best 3 picks
