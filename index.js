@@ -417,11 +417,13 @@ const extraIdOf = (espnId) => { // numeric + far above football-data ids so butt
   if (Number.isFinite(n) && n > 0) return 9e12 + n;
   return 9e12 + parseInt(crypto.createHash('md5').update(String(espnId)).digest('hex').slice(0, 8), 16);
 };
+const extraDiag = { at: 0, espnLeagues: 0, espnOk: 0, espnFail: 0, firstErr: '', espnCount: 0, sdbCount: 0, sdbErr: '', kept: 0, withOdds: 0 };
 async function espnLeague(slug, today) {
   const url = `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard?limit=100&dates=${ymd(Date.now() - 864e5)}-${ymd(Date.now() + 864e5)}`;
   try {
     const res = await fetchRetry(url, {}, 15000, 2);
-    if (!res.ok) return [];
+    if (!res.ok) { extraDiag.espnFail++; if (!extraDiag.firstErr) extraDiag.firstErr = `${slug}: HTTP ${res.status}`; return []; }
+    extraDiag.espnOk++;
     const data = await res.json();
     const out = [];
     for (const ev of data.events || []) {
@@ -441,13 +443,41 @@ async function espnLeague(slug, today) {
       });
     }
     return out;
-  } catch (e) { return []; }
+  } catch (e) { extraDiag.espnFail++; if (!extraDiag.firstErr) extraDiag.firstErr = `${slug}: ${(e.cause && e.cause.code) || e.message}`; return []; }
+}
+// Second, independent source: TheSportsDB (free public key '3') lists soccer events of a whole day in ONE call.
+async function sportsDbDay(dateStr, today) {
+  try {
+    const res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${dateStr}&s=Soccer`, {}, 20000, 2);
+    if (!res.ok) { extraDiag.sdbErr = 'HTTP ' + res.status; return []; }
+    const data = await res.json();
+    const out = [];
+    for (const ev of data.events || []) {
+      if (!ev.strHomeTeam || !ev.strAwayTeam) continue;
+      const stt = String(ev.strStatus || '').toLowerCase();
+      if (ev.intHomeScore != null && ev.intHomeScore !== '') continue; // already has a score
+      if (stt && !['not started', 'ns', 'scheduled', 'time to be defined', 'tbd'].includes(stt)) continue;
+      const iso = ev.strTimestamp ? ev.strTimestamp : `${ev.dateEvent}T${ev.strTime || '12:00:00'}`;
+      const utc = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + 'Z').getTime();
+      if (!Number.isFinite(utc) || localDate(new Date(utc)) !== today) continue;
+      out.push({
+        id: 8e12 + (Number(ev.idEvent) || 0), comp: 'X:sdb:' + (ev.idLeague || '0'), compName: ev.strLeague || 'Other football', slug: null, extra: true,
+        home: ev.strHomeTeam, away: ev.strAwayTeam, homeFull: ev.strHomeTeam, awayFull: ev.strAwayTeam, homeId: null, awayId: null, utc, odds: null,
+      });
+    }
+    return out;
+  } catch (e) { extraDiag.sdbErr = (e.cause && e.cause.code) || e.message; return []; }
 }
 async function getExtraFixtures(today, existing) {
   if (!EXTRA_ON) return [];
   const slugs = Object.keys(ESPN_LEAGUES);
+  Object.assign(extraDiag, { at: Date.now(), espnLeagues: slugs.length, espnOk: 0, espnFail: 0, firstErr: '', sdbErr: '' });
   const lists = await pool(slugs, 5, (slug) => espnLeague(slug, today));
   let extras = lists.flat();
+  extraDiag.espnCount = extras.length;
+  const sdb = (await Promise.all([-1, 0, 1].map((d) => sportsDbDay(new Date(Date.now() + d * 864e5).toISOString().slice(0, 10), today)))).flat();
+  extraDiag.sdbCount = sdb.length;
+  extras = extras.concat(sdb);
   // drop anything football-data already gave us (same teams, kickoff within 3h)
   const same = (a, b) => Math.abs(a.utc - b.utc) < 3 * 3600e3 && nameScore(a.homeFull, b.homeFull) >= 0.99 && nameScore(a.awayFull, b.awayFull) >= 0.99;
   const seen = [];
@@ -462,7 +492,8 @@ async function getExtraFixtures(today, existing) {
       } catch (e) { console.log('Extra odds failed for', sl, e.message); }
     }
   }
-  console.log(`Extra fixtures today: ${extras.length} (${extras.filter((x) => x.odds).length} with odds)`);
+  extraDiag.kept = extras.length; extraDiag.withOdds = extras.filter((x) => x.odds).length;
+  console.log(`Extra fixtures today: ${extras.length} (${extraDiag.withOdds} with odds) | ESPN ${extraDiag.espnCount} (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues ok${extraDiag.firstErr ? ', first error: ' + extraDiag.firstErr : ''}) | TheSportsDB ${extraDiag.sdbCount}${extraDiag.sdbErr ? ' (' + extraDiag.sdbErr + ')' : ''}`);
   return extras;
 }
 
@@ -1686,37 +1717,48 @@ function stakeTxt(u, p, o) {
 }
 
 // ----- /today -----
-async function renderPage(page, u) {
-  const all = await getMatchesToday();
+const dayName = (off) => (off === 0 ? 'Today' : off === 1 ? 'Tomorrow' : new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday: 'short', day: '2-digit', month: 'short' }).format(new Date(Date.now() + off * 864e5)));
+const dayTabs = (day) => [0, 1, 2].map((d) => Markup.button.callback((d === day ? '• ' : '') + dayName(d), `pd:${d}:0`));
+async function listForDay(day) {
+  if (day === 0) return getMatchesToday();
+  const target = localDate(new Date(Date.now() + day * 864e5));
+  return (await getUpcoming()).filter((m) => localDate(new Date(m.utc)) === target).sort((a, b) => a.compName.localeCompare(b.compName) || a.utc - b.utc);
+}
+async function renderPage(page, u, day = 0) {
+  const all = await listForDay(day);
   const lg = userLeagues(u);
   const list = lg.length ? all.filter((m) => lg.includes(m.comp) || m.extra) : all;
-  if (!list.length) return {
-    text: all.length
-      ? '😴 No matches today in your selected leagues. Change them in /settings.'
-      : '😴 No matches today in the covered leagues.' +
-        (nextInfo
-          ? `\n📅 Next up: ${nextInfo.n} match${nextInfo.n > 1 ? 'es' : ''} on ${nextInfo.date}.`
-          : '\n📅 Nothing in the next 2 days either (likely an international break).'),
-    kb: null,
-  };
+  const tabs = dayTabs(day);
+  if (!list.length) {
+    const when = day === 0 ? 'today' : day === 1 ? 'tomorrow' : 'on ' + dayName(day);
+    let text = all.length ? `😴 No matches ${when} in your selected leagues. Change them in /settings.` : `😴 No matches ${when} in the covered leagues.`;
+    if (day === 0 && !all.length) text += nextInfo
+      ? `\n📅 Next up: ${nextInfo.n} match${nextInfo.n > 1 ? 'es' : ''} on ${nextInfo.date}.`
+      : '\n📅 Nothing in the next 2 days either (likely an international break).';
+    return { text, kb: Markup.inlineKeyboard([tabs, [Markup.button.callback('🔄 Refresh', `rf:${day}:0`), Markup.button.callback('⚙️ Leagues', 'set:lg'), MENU_BTN]]) };
+  }
   const pages = Math.ceil(list.length / PAGE_SIZE);
   page = Math.max(0, Math.min(page, pages - 1));
   const slice = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  let text = t(u, 'today_head', list.length, page + 1, pages) + '\n';
+  let text = day === 0 ? t(u, 'today_head', list.length, page + 1, pages) + '\n' : `📅 <b>${dayName(day)}'s matches</b> (${list.length}) — page ${page + 1}/${pages}\n`;
   let lastComp = '';
   slice.forEach((m, i) => {
     if (m.compName !== lastComp) { text += `\n🏆 <b>${esc(m.compName)}</b>\n`; lastComp = m.compName; }
     text += `${i + 1}. 🕒 ${fmtTime(m.utc)} ${esc(m.home)} vs ${esc(m.away)}\n${oddsLine(m)}\n`;
   });
   text += '\n👇 Tap a number for history + AI prediction.';
-  const nums = slice.map((m, i) => Markup.button.callback(String(i + 1), `m:${m.id}:${page}`));
-  const nav = [];
-  if (page > 0) nav.push(Markup.button.callback('◀️ Prev', `pg:${page - 1}`));
-  if (page < pages - 1) nav.push(Markup.button.callback('Next ▶️', `pg:${page + 1}`));
-  const rows = [nums];
-  if (nav.length) rows.push(nav);
+  const nums = slice.map((m, i) => Markup.button.callback(String(i + 1), `m:${m.id}:${day * 100 + page}`));
+  const rows = [tabs, nums];
+  if (pages > 1) {
+    const nav = [];
+    nav.push(page > 0 ? Markup.button.callback('◀️ Prev', `pd:${day}:${page - 1}`) : Markup.button.callback('·', 'noop'));
+    nav.push(Markup.button.callback(`${page + 1} / ${pages}`, 'noop'));
+    nav.push(page < pages - 1 ? Markup.button.callback('Next ▶️', `pd:${day}:${page + 1}`) : Markup.button.callback('·', 'noop'));
+    rows.push(nav);
+  }
   rows.push([Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3')]);
   rows.push([Markup.button.callback('📈 Value', 'value'), Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('🔴 Live', 'live')]);
+  rows.push([Markup.button.callback('🔄 Refresh', `rf:${day}:${page}`), MENU_BTN]);
   return { text, kb: Markup.inlineKeyboard(rows) };
 }
 
@@ -1812,6 +1854,7 @@ async function renderDetailFor(m, backData, u) {
   tx += '\n' + t(u, 'disc');
   const rows = [[Markup.button.callback('⭐ Watch', `w:${m.id}`), Markup.button.callback('🔁 H2H history', `h2h:${m.id}`)]];
   if (backData) rows.push([Markup.button.callback('⬅️ Back to list', backData)]);
+  rows.push([Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
 }
 
@@ -1925,6 +1968,7 @@ async function renderAcca(u, mode = 'balanced', legsN = 3) {
   const kb = Markup.inlineKeyboard([
     ['safe', 'balanced', 'risky'].map((md) => Markup.button.callback((md === mode ? '• ' : '') + md[0].toUpperCase() + md.slice(1), `acca:${md}:${legsN}`)),
     [2, 3, 4, 5].map((n) => Markup.button.callback((n === legsN ? '• ' : '') + n + ' legs', `acca:${mode}:${n}`)),
+    [Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('⚽ Today', 'today'), MENU_BTN],
   ]);
   if (legs.length < 2) return { text: `🎯 <b>Accumulator (${mode})</b>\n\nNot enough qualifying matches today for a ${mode} acca. Try another style or check back later.\n\n` + t(u, 'disc'), kb };
   let odds = 1, bestOdds = 1, prob = 1;
@@ -2033,7 +2077,7 @@ async function renderTable(code) {
   tx += '</pre>';
   return { text: tx, kb: tableKb() };
 }
-const tableKb = () => Markup.inlineKeyboard([...DOMESTIC].reduce((rows, c, i) => { if (i % 3 === 0) rows.push([]); rows[rows.length - 1].push(Markup.button.callback(LEAGUE_NAMES[c] || c, `tb:${c}`)); return rows; }, []));
+const tableKb = () => withNav(Markup.inlineKeyboard([...DOMESTIC].reduce((rows, c, i) => { if (i % 3 === 0) rows.push([]); rows[rows.length - 1].push(Markup.button.callback(LEAGUE_NAMES[c] || c, `tb:${c}`)); return rows; }, [])));
 
 // ----- Head-to-head history -----
 function getH2H(id) {
@@ -2081,6 +2125,7 @@ function settingsView(u, premium) {
     [Markup.button.callback(u.sub_daily ? '🔕 Turn daily picks off' : '🔔 Turn daily picks on', 'set:sub')],
     [Markup.button.callback('🕘 −1h', 'set:h-'), Markup.button.callback('🕘 +1h', 'set:h+'), Markup.button.callback('🏆 Leagues', 'set:lg')],
     [Markup.button.callback('🌍 Language', 'set:lang')],
+    [MENU_BTN],
   ]);
   return { text: tx, kb };
 }
@@ -2104,7 +2149,8 @@ function premiumView(u) {
   const rows = [];
   if (STARS_ON) rows.push(['week', 'month'].map((k) => Markup.button.callback(`⭐ ${PLANS[k].label} · ${PLANS[k].stars}`, `buy:xtr:${k}`)));
   if (PAYSTACK_KEY) rows.push(['week', 'month'].map((k) => Markup.button.callback(`💳 ${PLANS[k].label} · ₦${money(PLANS[k].ngn)}`, `buy:ps:${k}`)));
-  return { text: tx, kb: rows.length ? Markup.inlineKeyboard(rows) : null };
+  rows.push([MENU_BTN]);
+  return { text: tx, kb: Markup.inlineKeyboard(rows) };
 }
 
 // ----- Watchlist -----
@@ -2118,14 +2164,14 @@ async function addWatch(u, m) {
 }
 async function renderWatchlist(u) {
   const { rows } = await q('SELECT * FROM watch WHERE user_id = $1 AND utc > $2 ORDER BY utc', [u.id, Date.now() - 6 * 3600e3]);
-  if (!rows.length) return { text: '⭐ Your watchlist is empty. Open a match from /today and tap ⭐ Watch to get a kickoff alert and the result.', kb: null };
+  if (!rows.length) return { text: '⭐ Your watchlist is empty. Open a match from /today and tap ⭐ Watch to get a kickoff alert and the result.', kb: navKb() };
   let tx = '⭐ <b>Watchlist</b>\n\n';
   const btns = [];
   rows.forEach((w, i) => {
     tx += `${i + 1}. <b>${esc(w.home)} vs ${esc(w.away)}</b> — ${fmtDate(w.utc)} ${fmtTime(w.utc)}${w.lean ? `\n   lean: ${esc(w.lean)}` : ''}\n`;
     btns.push(Markup.button.callback(`❌ ${i + 1}`, `uw:${w.match_id}`));
   });
-  return { text: tx, kb: Markup.inlineKeyboard([btns]) };
+  return { text: tx, kb: withNav(Markup.inlineKeyboard([btns])) };
 }
 
 // ---------- Background jobs ----------
@@ -2273,15 +2319,54 @@ async function applyReferral(ctx, refId) {
 // ----- basics -----
 const mainKb = (u) => Markup.inlineKeyboard([
   [Markup.button.callback('⚽ Today', 'today'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3')],
-  [Markup.button.callback('📈 Value', 'value'), Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('⭐ Premium', 'up')],
+  [Markup.button.callback('📈 Value', 'value'), Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('🔴 Live', 'live')],
+  [Markup.button.callback('📊 Tables', 'tbl'), Markup.button.callback('⭐ Watchlist', 'wl'), Markup.button.callback('⚙️ Settings', 'st')],
+  [Markup.button.callback('💳 Premium', 'up'), Markup.button.callback('👤 Account', 'acct'), Markup.button.callback('❓ Help', 'help')],
 ]);
+// ----- GUI helpers: Menu button on every screen, bottom keyboard -----
+const MENU_BTN = Markup.button.callback('🏠 Menu', 'menu');
+const withNav = (kb, rows = []) => Markup.inlineKeyboard([...((kb && kb.reply_markup && kb.reply_markup.inline_keyboard) || []), ...rows, [MENU_BTN]]);
+const navKb = (rows = []) => withNav(null, rows);
+const replyMenu = Markup.keyboard([
+  ['⚽ Today', '🏆 Top 5', '💎 Best 3'],
+  ['📈 Value', '🎯 Acca', '🔴 Live'],
+  ['📊 Tables', '⭐ Watchlist', '⚙️ Settings'],
+  ['💳 Premium', '👤 Account', '❓ Help'],
+]).resize();
+if (replyMenu.reply_markup) { replyMenu.reply_markup.is_persistent = true; replyMenu.reply_markup.input_field_placeholder = 'Pick an option…'; }
+const showToday = async (ctx) => {
+  await ctx.sendChatAction('typing').catch(() => {});
+  try { const { text, kb } = await renderPage(0, ctx.u); await reply(ctx, text, kb); }
+  catch (e) { console.error(e); await ctx.reply('⚠️ Could not load matches right now. Please try again in a minute.'); }
+};
+const MENU_ACTIONS = {
+  '⚽ Today': (ctx) => showToday(ctx),
+  '🏆 Top 5': (ctx) => picksHandler('top5')(ctx),
+  '💎 Best 3': (ctx) => picksHandler('best3')(ctx),
+  '📈 Value': (ctx) => (ctx.premium ? valueH(ctx) : paywall(ctx)),
+  '🎯 Acca': async (ctx) => { if (!ctx.premium) return paywall(ctx); const r = await renderAcca(ctx.u, 'balanced', 3); return reply(ctx, r.text, r.kb); },
+  '🔴 Live': (ctx) => toolHandler(() => renderLive(), 'live')(ctx),
+  '📊 Tables': async (ctx) => { const r = await renderTable(''); return reply(ctx, r.text, r.kb); },
+  '⭐ Watchlist': async (ctx) => { if (!ctx.premium) return paywall(ctx); const r = await renderWatchlist(ctx.u); return reply(ctx, r.text, r.kb); },
+  '⚙️ Settings': (ctx) => { const v = settingsView(ctx.u, ctx.premium); return reply(ctx, v.text, v.kb); },
+  '💳 Premium': (ctx) => showPremium(ctx),
+  '👤 Account': async (ctx) => reply(ctx, await renderAccount(ctx), navKb()),
+  '❓ Help': (ctx) => helpH(ctx),
+};
+bot.hears(Object.keys(MENU_ACTIONS), (ctx) => { Promise.resolve(MENU_ACTIONS[ctx.message.text](ctx)).catch((e) => console.error(e)); });
+bot.command('menu', (ctx) => reply(ctx, '🏠 <b>Main menu</b>\nWhat would you like to see?', mainKb(ctx.u)));
+bot.action('menu', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); await editOrReply(ctx, '🏠 <b>Main menu</b>\nWhat would you like to see?', mainKb(ctx.u)); });
+for (const [id, label] of [['tbl', '📊 Tables'], ['wl', '⭐ Watchlist'], ['st', '⚙️ Settings'], ['acct', '👤 Account'], ['help', '❓ Help']]) {
+  bot.action(id, async (ctx) => { await ctx.answerCbQuery().catch(() => {}); Promise.resolve(MENU_ACTIONS[label](ctx)).catch((e) => console.error(e)); });
+}
 bot.start(async (ctx) => {
   const payload = ctx.startPayload || '';
   if (ctx.isNew && payload.startsWith('ref_')) await applyReferral(ctx, Number(payload.slice(4))).catch((e) => console.log('Referral failed:', e.message));
   await reply(ctx, t(ctx.u, 'start', ctx.from.first_name) + '\n\n' + t(ctx.u, 'disc'), mainKb(ctx.u));
+  await ctx.reply('👇 Your quick menu is now at the bottom of the chat.', replyMenu);
 });
 
-bot.help((ctx) => {
+const helpH = (ctx) => {
   const tot = W_MKT + W_FORM + W_AI;
   return reply(ctx,
     '<b>How it works</b>\n' +
@@ -2291,8 +2376,9 @@ bot.help((ctx) => {
       'Top 5 = matches where the blended probability of one outcome is highest.\n' +
       'Best 3 = same blend, but only matches where neither team is a big-name club or in the top ' + TOP_RANK_EXCLUDE + ' of its table.\n' +
       'Value = model probability beats the best bookmaker price by a margin. Acca = picks combined from today\'s best matches.\n\n' +
-      CMD_LIST + '\n\n' + t(ctx.u, 'disc'));
-});
+      CMD_LIST + '\n\n' + t(ctx.u, 'disc'), navKb());
+};
+bot.help(helpH);
 
 bot.command('today', async (ctx) => {
   await ctx.sendChatAction('typing');
@@ -2302,6 +2388,22 @@ bot.command('today', async (ctx) => {
 bot.action('today', async (ctx) => {
   await ctx.answerCbQuery();
   try { const { text, kb } = await renderPage(0, ctx.u); await reply(ctx, text, kb); } catch (e) { console.error(e); }
+});
+bot.action('noop', (ctx) => ctx.answerCbQuery().catch(() => {}));
+bot.action(/^pd:(\d):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  try { const { text, kb } = await renderPage(Number(ctx.match[2]), ctx.u, Number(ctx.match[1])); await editOrReply(ctx, text, kb); }
+  catch (e) { console.error(e); await ctx.reply('⚠️ Could not load that day right now.'); }
+});
+const lastRefresh = new Map(); // protects football-data / Odds API quota from refresh spam
+bot.action(/^rf:(\d):(\d+)$/, async (ctx) => {
+  const day = Number(ctx.match[1]), k = 'd' + day;
+  if (Date.now() - (lastRefresh.get(k) || 0) < 120e3) return ctx.answerCbQuery('✅ Already fresh — updated moments ago').catch(() => {});
+  lastRefresh.set(k, Date.now());
+  await ctx.answerCbQuery('Refreshing…').catch(() => {});
+  cache.delete(day === 0 ? 'today:' + localDate(new Date()) : 'upcoming:' + localDate(new Date()));
+  try { const { text, kb } = await renderPage(Number(ctx.match[2]), ctx.u, day); await editOrReply(ctx, text, kb); }
+  catch (e) { console.error(e); await ctx.reply('⚠️ Refresh failed, try again in a minute.'); }
 });
 bot.action(/^pg:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -2318,7 +2420,8 @@ bot.action(/^m:(\d+):(\d+)$/, async (ctx) => {
   try {
     const m = await findMatchAny(Number(ctx.match[1]));
     if (!m) return editOrReply(ctx, 'Match not found (list refreshed). Use /today again.', null);
-    const { text, kb } = await renderDetailFor(m, `pg:${ctx.match[2]}`, ctx.u);
+    const enc = Number(ctx.match[2]), dd = Math.floor(enc / 100), pn = enc % 100;
+    const { text, kb } = await renderDetailFor(m, `pd:${dd}:${pn}`, ctx.u);
     await editOrReply(ctx, text, kb);
   } catch (e) { console.error(e); await ctx.reply('⚠️ Could not analyse that match right now.'); }
 });
@@ -2330,7 +2433,8 @@ const picksHandler = (kind) => async (ctx) => {
     await ctx.sendChatAction('typing');
     const r = await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: ctx.premium });
     await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
-    await replyLong(ctx, r.text, r.kb);
+    const other = kind === 'top5' ? Markup.button.callback('💎 Best 3', 'best3') : Markup.button.callback('🏆 Top 5', 'top5');
+    await replyLong(ctx, r.text, withNav(r.kb, [[other, Markup.button.callback('⚽ Today', 'today')]]));
   } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
 };
 bot.command('top5', detach(picksHandler('top5')));
@@ -2339,16 +2443,16 @@ bot.action('top5', async (ctx) => { await ctx.answerCbQuery(); picksHandler('top
 bot.action('best3', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best3')(ctx).catch(console.error); });
 
 // premium-only analysis tools
-const toolHandler = (render) => async (ctx) => {
+const toolHandler = (render, again) => async (ctx) => {
   const wait = await ctx.reply(t(ctx.u, 'wait_generic'));
   try {
     await ctx.sendChatAction('typing');
     const r = await render(ctx);
     await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
-    if (typeof r === 'string') await replyLong(ctx, r); else await replyLong(ctx, r.text, r.kb);
+    if (typeof r === 'string') await replyLong(ctx, r, navKb(again ? [[Markup.button.callback('🔄 Refresh', again)]] : [])); else await replyLong(ctx, r.text, r.kb ? withNav(r.kb) : navKb());
   } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
 };
-const valueH = toolHandler((ctx) => renderValue(ctx.u));
+const valueH = toolHandler((ctx) => renderValue(ctx.u), 'value');
 const goalsH = toolHandler((ctx) => renderGoals(ctx.u));
 const dcH = toolHandler((ctx) => renderDC(ctx.u));
 const accaFromText = (ctx) => {
@@ -2373,8 +2477,8 @@ bot.action(/^acca:(safe|balanced|risky):(\d)$/, async (ctx) => {
 });
 
 // free tools
-bot.command('live', detach(toolHandler(() => renderLive())));
-bot.action('live', async (ctx) => { await ctx.answerCbQuery(); toolHandler(() => renderLive())(ctx).catch(console.error); });
+bot.command('live', detach(toolHandler(() => renderLive(), 'live')));
+bot.action('live', async (ctx) => { await ctx.answerCbQuery(); toolHandler(() => renderLive(), 'live')(ctx).catch(console.error); });
 bot.command('table', async (ctx) => {
   const code = argText(ctx).toUpperCase();
   try { const r = await renderTable(code); await reply(ctx, r.text, r.kb); } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
@@ -2601,6 +2705,12 @@ bot.command('payments', adminOnly(async (ctx) => {
   if (!rows.length) return reply(ctx, 'No payments yet.');
   await reply(ctx, '💳 <b>Last payments</b>\n' + rows.map((p) => `${p.status === 'success' ? '✅' : '⏳'} <code>${p.user_id}</code> ${p.provider} ${p.plan} ${p.currency === 'XTR' ? p.amount + '⭐' : '₦' + money(p.amount)} · ${fmtDate(p.created_at)}`).join('\n'));
 }));
+bot.command('fixtures', adminOnly(async (ctx) => {
+  cache.delete('today:' + localDate(new Date()));
+  const all = await getMatchesToday().catch((e) => { extraDiag.firstErr = extraDiag.firstErr || e.message; return []; });
+  const ex = all.filter((m) => m.extra).length;
+  return reply(ctx, `🔧 <b>Fixture sources</b> (${localDate(new Date())})\nfootball-data: <b>${all.length - ex}</b>\nESPN: <b>${extraDiag.espnCount}</b> (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues answered${extraDiag.firstErr ? ' · first error: ' + esc(extraDiag.firstErr) : ''})\nTheSportsDB: <b>${extraDiag.sdbCount}</b>${extraDiag.sdbErr ? ' · error: ' + esc(extraDiag.sdbErr) : ''}\nShown in /today: <b>${all.length}</b> (${extraDiag.withOdds} extras with odds)`);
+}));
 bot.command('credits', adminOnly((ctx) => reply(ctx, oddsCredits.remaining == null
   ? '🎟 No Odds API call has been made since the bot started.'
   : `🎟 The Odds API: <b>${oddsCredits.remaining}</b> credits left${oddsCredits.used != null ? ` (${oddsCredits.used} used)` : ''} — as of ${fmtTime(oddsCredits.at)}.`)));
@@ -2651,6 +2761,7 @@ process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e)
 process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
 
 const PUBLIC_COMMANDS = [
+  { command: 'menu', description: 'Open the main menu' },
   { command: 'today', description: "Today's matches with odds" },
   { command: 'top5', description: 'Top 5 picks of the day' },
   { command: 'best3', description: 'Best 3 under-the-radar picks' },
