@@ -2256,28 +2256,52 @@ async function renderDC(u) {
 }
 
 // ----- Live scores -----
+const LIVE_CACHE_MS = Number(process.env.LIVE_CACHE_MS || 30e3); // how long a live-score fetch is shared between users
 function getLive() {
-  return cached('live:' + localDate(new Date()), 60e3, async () => {
+  return cached('live', LIVE_CACHE_MS, async () => {
     const from = localDate(new Date(Date.now() - 864e5)), to = localDate(new Date(Date.now() + 864e5));
     const data = await fdGet(`/matches?dateFrom=${from}&dateTo=${to}`);
-    const today = localDate(new Date());
-    return (data.matches || []).filter((m) => ['IN_PLAY', 'PAUSED', 'LIVE', 'FINISHED'].includes(m.status) && localDate(new Date(m.utcDate)) === today);
+    const today = localDate(new Date()), now = Date.now();
+    const list = (data.matches || []).filter((m) => {
+      const ko = new Date(m.utcDate).getTime();
+      if (['IN_PLAY', 'PAUSED', 'LIVE'].includes(m.status)) return true; // live, even if it started before midnight
+      if (m.status === 'FINISHED') return localDate(new Date(ko)) === today;
+      return ['TIMED', 'SCHEDULED'].includes(m.status) && ko <= now && now - ko < 3 * 3600e3; // kicked off but the feed has not caught up
+    });
+    return { at: Date.now(), list };
   });
 }
+const liveKb = () => Markup.inlineKeyboard([[Markup.button.callback('🔄 Refresh', 'live')], [Markup.button.callback('⚽ Today', 'today'), Markup.button.callback('🏠 Menu', 'menu')]]);
 async function renderLive() {
-  const list = await getLive();
-  if (!list.length) return '🔴 No live or finished matches yet today in the covered leagues.';
-  const live = list.filter((m) => m.status !== 'FINISHED');
-  let tx = `🔴 <b>Scores</b> — ${live.length} live · ${list.length - live.length} finished\n`;
+  const { at, list } = await getLive();
+  const stamp = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(at));
+  if (!list.length) return { text: `🔴 <b>Scores</b>\n\nNo live or finished matches yet today in the covered leagues.\n\n🕒 Updated ${stamp}`, kb: liveKb() };
+  const isLive = (m) => ['IN_PLAY', 'PAUSED', 'LIVE'].includes(m.status);
+  const waiting = list.filter((m) => !isLive(m) && m.status !== 'FINISHED');
+  let tx = `🔴 <b>Scores</b> — ${list.filter(isLive).length} live · ${list.filter((m) => m.status === 'FINISHED').length} finished` + (waiting.length ? ` · ${waiting.length} awaiting feed` : '') + '\n';
   let last = '';
   for (const m of list.sort((a, b) => a.competition.name.localeCompare(b.competition.name) || new Date(a.utcDate) - new Date(b.utcDate))) {
     if (m.competition.name !== last) { tx += `\n🏆 <b>${esc(m.competition.name)}</b>\n`; last = m.competition.name; }
-    const s = m.score && m.score.fullTime ? m.score.fullTime : {};
+    const hn = esc(m.homeTeam.shortName || m.homeTeam.name), an = esc(m.awayTeam.shortName || m.awayTeam.name);
+    if (!isLive(m) && m.status !== 'FINISHED') { tx += `⏳ ${hn} vs ${an} — kicked off ${fmtTime(new Date(m.utcDate).getTime())}, score not in the feed yet\n`; continue; }
+    const sc = m.score && m.score.fullTime ? m.score.fullTime : {};
     const tag = m.status === 'FINISHED' ? '✅ FT' : m.status === 'PAUSED' ? '⏸ HT' : '🔴 LIVE';
-    tx += `${tag} ${esc(m.homeTeam.shortName || m.homeTeam.name)} <b>${s.home == null ? 0 : s.home}-${s.away == null ? 0 : s.away}</b> ${esc(m.awayTeam.shortName || m.awayTeam.name)}\n`;
+    tx += `${tag} ${hn} <b>${sc.home == null ? 0 : sc.home}-${sc.away == null ? 0 : sc.away}</b> ${an}\n`;
   }
-  return tx + '\n<i>Refreshes at most once a minute.</i>';
+  tx += `\n🕒 Updated ${stamp} (${TZ}) · tap 🔄 to refresh`;
+  if (waiting.length) tx += '\n<i>Some scores lag behind the real match: the football-data.org feed on the free plan is delayed by a few minutes.</i>';
+  return { text: tx, kb: liveKb() };
 }
+const liveH = async (ctx) => {
+  const fromBtn = !!ctx.callbackQuery;
+  try {
+    if (!fromBtn) await ctx.sendChatAction('typing');
+    const r = await renderLive();
+    const msg = fromBtn && ctx.callbackQuery.message;
+    if (msg && /Scores/.test(msg.text || '')) return await editOrReply(ctx, r.text, r.kb); // refresh in place instead of piling up messages
+    return await reply(ctx, r.text, r.kb);
+  } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
+};
 
 // ----- League table (built from the season data already downloaded: no extra API request) -----
 async function renderTable(code) {
@@ -2962,7 +2986,7 @@ const MENU_ACTIONS = {
   '💎 Best 3': (ctx) => picksHandler('best3')(ctx),
   '📈 Value': (ctx) => (ctx.premium ? valueH(ctx) : paywall(ctx)),
   '🎯 Acca': async (ctx) => { if (!ctx.premium) return paywall(ctx); const r = await renderAcca(ctx.u, 'balanced', 3); return reply(ctx, r.text, r.kb); },
-  '🔴 Live': (ctx) => toolHandler(() => renderLive(), 'live')(ctx),
+  '🔴 Live': (ctx) => liveH(ctx),
   '📊 Tables': async (ctx) => { const r = await renderTable(''); return reply(ctx, r.text, r.kb); },
   '⭐ Watchlist': async (ctx) => { if (!ctx.premium) return paywall(ctx); const r = await renderWatchlist(ctx.u); return reply(ctx, r.text, r.kb); },
   '⚙️ Settings': (ctx) => { const v = settingsView(ctx.u, ctx.premium); return reply(ctx, v.text, v.kb); },
@@ -3107,8 +3131,8 @@ bot.action(/^acca:(safe|balanced|risky):(\d)$/, async (ctx) => {
 });
 
 // free tools
-bot.command('live', detach(toolHandler(() => renderLive(), 'live')));
-bot.action('live', async (ctx) => { await ctx.answerCbQuery(); toolHandler(() => renderLive(), 'live')(ctx).catch(console.error); });
+bot.command('live', detach(liveH));
+bot.action('live', async (ctx) => { await ctx.answerCbQuery('Updating…').catch(() => {}); liveH(ctx).catch(console.error); });
 bot.command('table', async (ctx) => {
   const code = argText(ctx).toUpperCase();
   try { const r = await renderTable(code); await reply(ctx, r.text, r.kb); } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
