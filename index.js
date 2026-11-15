@@ -417,15 +417,36 @@ const extraIdOf = (espnId) => { // numeric + far above football-data ids so butt
   if (Number.isFinite(n) && n > 0) return 9e12 + n;
   return 9e12 + parseInt(crypto.createHash('md5').update(String(espnId)).digest('hex').slice(0, 8), 16);
 };
-const extraDiag = { at: 0, espnLeagues: 0, espnOk: 0, espnFail: 0, firstErr: '', espnCount: 0, sdbCount: 0, sdbErr: '', kept: 0, withOdds: 0 };
+const extraDiag = { at: 0, espnLeagues: 0, espnOk: 0, espnFail: 0, espnMissing: 0, oxCount: 0, oxErr: '', firstErr: '', espnCount: 0, sdbCount: 0, sdbErr: '', kept: 0, withOdds: 0 };
+const FEED_HEADERS = { 'User-Agent': 'Mozilla/5.0 (compatible; FootballBot/1.0)', Accept: 'application/json' };
+async function espnJson(slug, dateStr) { // tries a few URL shapes; ESPN rejects some date formats with HTTP 400
+  const base = `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard`;
+  const variants = [`${base}?dates=${dateStr}`, base, `https://site.web.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard?dates=${dateStr}`];
+  let last = '';
+  for (const url of variants) {
+    try {
+      const res = await fetchRetry(url, { headers: FEED_HEADERS }, 15000, 2);
+      if (res.ok) return await res.json();
+      last = `HTTP ${res.status}`;
+      if (res.status === 404) { const e = new Error(last); e.missing = true; throw e; }
+    } catch (e) { if (e.missing) throw e; last = (e.cause && e.cause.code) || e.message; }
+  }
+  throw new Error(last);
+}
 async function espnLeague(slug, today) {
-  const url = `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard?limit=100&dates=${ymd(Date.now() - 864e5)}-${ymd(Date.now() + 864e5)}`;
-  try {
-    const res = await fetchRetry(url, {}, 15000, 2);
-    if (!res.ok) { extraDiag.espnFail++; if (!extraDiag.firstErr) extraDiag.firstErr = `${slug}: HTTP ${res.status}`; return []; }
-    extraDiag.espnOk++;
-    const data = await res.json();
-    const out = [];
+  const dates = [ymd(Date.now())];
+  if (/^(usa|mex|arg|bra|conmebol|concacaf)/.test(slug)) dates.push(ymd(Date.now() - 864e5)); // late Americas kickoffs fall on the previous US date
+  const out = [];
+  let answered = false;
+  for (const d of dates) {
+    let data;
+    try { data = await espnJson(slug, d); }
+    catch (e) {
+      if (e.missing) { extraDiag.espnMissing++; return out; }
+      if (!extraDiag.firstErr) extraDiag.firstErr = `${slug}: ${e.message}`;
+      continue;
+    }
+    answered = true;
     for (const ev of data.events || []) {
       const st = ev.status && ev.status.type && ev.status.type.state;
       if (st && st !== 'pre') continue; // only matches that have not started
@@ -435,20 +456,27 @@ async function espnLeague(slug, today) {
       const h = comp && (comp.competitors || []).find((c) => c.homeAway === 'home');
       const a = comp && (comp.competitors || []).find((c) => c.homeAway === 'away');
       if (!h || !a || !h.team || !a.team) continue;
+      const id = extraIdOf(ev.id);
+      if (out.some((x) => x.id === id)) continue;
       out.push({
-        id: extraIdOf(ev.id), comp: 'X:' + slug, compName: ESPN_LEAGUES[slug] || slug, slug, extra: true,
+        id, comp: 'X:' + slug, compName: ESPN_LEAGUES[slug] || slug, slug, extra: true,
         home: h.team.shortDisplayName || h.team.displayName, away: a.team.shortDisplayName || a.team.displayName,
         homeFull: h.team.displayName || h.team.shortDisplayName, awayFull: a.team.displayName || a.team.shortDisplayName,
         homeId: null, awayId: null, utc, odds: null,
       });
     }
-    return out;
-  } catch (e) { extraDiag.espnFail++; if (!extraDiag.firstErr) extraDiag.firstErr = `${slug}: ${(e.cause && e.cause.code) || e.message}`; return []; }
+  }
+  if (answered) extraDiag.espnOk++; else extraDiag.espnFail++;
+  return out;
 }
 // Second, independent source: TheSportsDB (free public key '3') lists soccer events of a whole day in ONE call.
 async function sportsDbDay(dateStr, today) {
   try {
-    const res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${dateStr}&s=Soccer`, {}, 20000, 2);
+    let res = null;
+    for (const key of ['3', '123']) { // both are TheSportsDB's public test keys
+      res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/${key}/eventsday.php?d=${dateStr}&s=Soccer`, { headers: FEED_HEADERS }, 20000, 2);
+      if (res.ok) break;
+    }
     if (!res.ok) { extraDiag.sdbErr = 'HTTP ' + res.status; return []; }
     const data = await res.json();
     const out = [];
@@ -468,32 +496,69 @@ async function sportsDbDay(dateStr, today) {
     return out;
   } catch (e) { extraDiag.sdbErr = (e.cause && e.cause.code) || e.message; return []; }
 }
+// Third source: The Odds API "events" lists (free, no credits used) - covers every in-season soccer competition it prices.
+async function oddsApiEventsDay(today) {
+  if (!ODDS_KEY) return [];
+  try {
+    const res = await fetchRetry(`https://api.the-odds-api.com/v4/sports/?apiKey=${ODDS_KEY}`, { headers: FEED_HEADERS }, 20000, 2);
+    if (!res.ok) { extraDiag.oxErr = 'sports HTTP ' + res.status; return []; }
+    const sports = (await res.json()).filter((x) => String(x.key).startsWith('soccer_') && x.active && !x.has_outrights);
+    const lists = await pool(sports, 5, async (sp) => {
+      try {
+        const r = await fetchRetry(`https://api.the-odds-api.com/v4/sports/${sp.key}/events?apiKey=${ODDS_KEY}&dateFormat=iso`, { headers: FEED_HEADERS }, 15000, 2);
+        if (!r.ok) return [];
+        return (await r.json()).map((ev) => ({ ev, sp }));
+      } catch (e) { return []; }
+    });
+    const out = [];
+    for (const { ev, sp } of lists.flat()) {
+      const utc = new Date(ev.commence_time).getTime();
+      if (!Number.isFinite(utc) || utc <= Date.now() || localDate(new Date(utc)) !== today) continue;
+      out.push({
+        id: 7e12 + parseInt(crypto.createHash('md5').update(String(ev.id)).digest('hex').slice(0, 8), 16),
+        comp: 'X:odds:' + sp.key, compName: sp.title || sp.key, slug: null, oddsKey: sp.key, extra: true,
+        home: ev.home_team, away: ev.away_team, homeFull: ev.home_team, awayFull: ev.away_team, homeId: null, awayId: null, utc, odds: null,
+      });
+    }
+    return out;
+  } catch (e) { extraDiag.oxErr = (e.cause && e.cause.code) || e.message; return []; }
+}
 async function getExtraFixtures(today, existing) {
   if (!EXTRA_ON) return [];
   const slugs = Object.keys(ESPN_LEAGUES);
-  Object.assign(extraDiag, { at: Date.now(), espnLeagues: slugs.length, espnOk: 0, espnFail: 0, firstErr: '', sdbErr: '' });
+  Object.assign(extraDiag, { at: Date.now(), espnLeagues: slugs.length, espnOk: 0, espnFail: 0, espnMissing: 0, oxCount: 0, oxErr: '', firstErr: '', sdbErr: '' });
   const lists = await pool(slugs, 5, (slug) => espnLeague(slug, today));
   let extras = lists.flat();
   extraDiag.espnCount = extras.length;
   const sdb = (await Promise.all([-1, 0, 1].map((d) => sportsDbDay(new Date(Date.now() + d * 864e5).toISOString().slice(0, 10), today)))).flat();
   extraDiag.sdbCount = sdb.length;
   extras = extras.concat(sdb);
+  extraDiag.oxErr = '';
+  const ox = await oddsApiEventsDay(today);
+  extraDiag.oxCount = ox.length;
+  extras = extras.concat(ox);
   // drop anything football-data already gave us (same teams, kickoff within 3h)
   const same = (a, b) => Math.abs(a.utc - b.utc) < 3 * 3600e3 && nameScore(a.homeFull, b.homeFull) >= 0.99 && nameScore(a.awayFull, b.awayFull) >= 0.99;
   const seen = [];
-  extras = extras.filter((x) => { if (existing.some((f) => same(x, f)) || seen.some((f) => same(x, f))) return false; seen.push(x); return true; });
+  extras = extras.filter((x) => {
+    if (existing.some((f) => same(x, f))) return false;
+    const k = seen.find((f) => same(x, f));
+    if (k) { if (!k.oddsKey && x.oddsKey) k.oddsKey = x.oddsKey; return false; } // keep the first copy, borrow the odds key
+    seen.push(x); return true;
+  });
   // odds (bonus): only leagues that really play today, capped to protect your Odds API credits
   if (ODDS_KEY && EXTRA_ODDS_ON) {
-    const slugsToday = [...new Set(extras.map((x) => x.slug))].filter((sl) => ESPN_TO_ODDS[sl]).slice(0, EXTRA_ODDS_MAX);
-    for (const sl of slugsToday) {
+    const keyOf = (x) => x.oddsKey || ESPN_TO_ODDS[x.slug];
+    const keysToday = [...new Set(extras.map(keyOf).filter(Boolean))].slice(0, EXTRA_ODDS_MAX);
+    for (const ok of keysToday) {
       try {
-        const events = await cached('odds:' + ESPN_TO_ODDS[sl], CACHE_MS, () => fetchOdds(ESPN_TO_ODDS[sl]));
-        for (const f of extras.filter((x) => x.slug === sl)) f.odds = findOdds({ home: f.homeFull, away: f.awayFull, utc: f.utc }, events);
-      } catch (e) { console.log('Extra odds failed for', sl, e.message); }
+        const events = await cached('odds:' + ok, CACHE_MS, () => fetchOdds(ok));
+        for (const f of extras.filter((x) => keyOf(x) === ok)) f.odds = findOdds({ home: f.homeFull, away: f.awayFull, utc: f.utc }, events);
+      } catch (e) { console.log('Extra odds failed for', ok, e.message); }
     }
   }
   extraDiag.kept = extras.length; extraDiag.withOdds = extras.filter((x) => x.odds).length;
-  console.log(`Extra fixtures today: ${extras.length} (${extraDiag.withOdds} with odds) | ESPN ${extraDiag.espnCount} (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues ok${extraDiag.firstErr ? ', first error: ' + extraDiag.firstErr : ''}) | TheSportsDB ${extraDiag.sdbCount}${extraDiag.sdbErr ? ' (' + extraDiag.sdbErr + ')' : ''}`);
+  console.log(`Extra fixtures today: ${extras.length} (${extraDiag.withOdds} with odds) | ESPN ${extraDiag.espnCount} (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues ok${extraDiag.firstErr ? ', first error: ' + extraDiag.firstErr : ''}) | TheSportsDB ${extraDiag.sdbCount}${extraDiag.sdbErr ? ' (' + extraDiag.sdbErr + ')' : ''} | OddsAPI events ${extraDiag.oxCount}${extraDiag.oxErr ? ' (' + extraDiag.oxErr + ')' : ''}`);
   return extras;
 }
 
@@ -2709,7 +2774,7 @@ bot.command('fixtures', adminOnly(async (ctx) => {
   cache.delete('today:' + localDate(new Date()));
   const all = await getMatchesToday().catch((e) => { extraDiag.firstErr = extraDiag.firstErr || e.message; return []; });
   const ex = all.filter((m) => m.extra).length;
-  return reply(ctx, `🔧 <b>Fixture sources</b> (${localDate(new Date())})\nfootball-data: <b>${all.length - ex}</b>\nESPN: <b>${extraDiag.espnCount}</b> (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues answered${extraDiag.firstErr ? ' · first error: ' + esc(extraDiag.firstErr) : ''})\nTheSportsDB: <b>${extraDiag.sdbCount}</b>${extraDiag.sdbErr ? ' · error: ' + esc(extraDiag.sdbErr) : ''}\nShown in /today: <b>${all.length}</b> (${extraDiag.withOdds} extras with odds)`);
+  return reply(ctx, `🔧 <b>Fixture sources</b> (${localDate(new Date())})\nfootball-data: <b>${all.length - ex}</b>\nESPN: <b>${extraDiag.espnCount}</b> (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues answered, ${extraDiag.espnMissing} unknown slugs${extraDiag.firstErr ? ' · first error: ' + esc(extraDiag.firstErr) : ''})\nTheSportsDB: <b>${extraDiag.sdbCount}</b>${extraDiag.sdbErr ? ' · error: ' + esc(extraDiag.sdbErr) : ''}\nOdds API events: <b>${extraDiag.oxCount}</b>${extraDiag.oxErr ? ' · error: ' + esc(extraDiag.oxErr) : ''}\nShown in /today: <b>${all.length}</b> (${extraDiag.withOdds} extras with odds)`);
 }));
 bot.command('credits', adminOnly((ctx) => reply(ctx, oddsCredits.remaining == null
   ? '🎟 No Odds API call has been made since the bot started.'
