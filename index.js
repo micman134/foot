@@ -1039,7 +1039,8 @@ function reasonOf(m, st) {
   return '';
 }
 
-async function computeTop5() {
+// Ranked list shared by Top 5 (premium) and Best 10 (free): 5 premium picks + the next 10.
+async function computeRanked() {
   const key = 'top5:' + localDate(new Date());
   const c = cache.get(key);
   if (c && c.exp > Date.now()) return c.val;
@@ -1068,10 +1069,12 @@ async function computeTop5Raw() {
   const refined = await pool(cands, AI_CONCURRENCY, async (x) => ({ m: x.m, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
   withStats.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
-  const top = rank(refined).slice(0, 5);
-  top.forEach((x) => logPrediction(x.m, x.st, 'top5'));
+  const top = rank(refined).slice(0, 15);
+  top.forEach((x, i) => logPrediction(x.m, x.st, i < 5 ? 'top5' : 'best10'));
   return top;
 }
+const computeTop5 = async () => (await computeRanked()).slice(0, 5);
+const computeBest10 = async () => (await computeRanked()).slice(BEST10_INCLUDES_TOP5 ? 0 : 5, BEST10_INCLUDES_TOP5 ? 10 : 15);
 
 // ---------- Best 3 : under-the-radar picks (never top-table or "popular" clubs) ----------
 // Uses the season data already downloaded for the other features, so it costs NO extra football-data requests.
@@ -1403,7 +1406,7 @@ async function renderStats() {
 
   // published picks: accuracy + flat-stake ROI
   const picks = done.filter((x) => x.tags && x.tags.length);
-  for (const [tag, label] of [['top5', 'Top 5'], ['best3', 'Best 3']]) {
+  for (const [tag, label] of [['top5', 'Top 5'], ['best10', 'Best 10'], ['best3', 'Best 3']]) {
     const r = done.filter((x) => x.tags && x.tags.includes(tag));
     if (!r.length) continue;
     const hit = r.filter((x) => argmax(x.final) === x.res).length;
@@ -1444,7 +1447,7 @@ function renderHistory() {
     const label = k === 'H' ? `${r.home} win` : k === 'A' ? `${r.away} win` : 'Draw';
     const sign = { H: '1', D: 'X', A: '2' };
     const icon = !r.res ? '⏳' : r.res === k ? '✅' : '❌';
-    const tags = (r.tags.includes('top5') ? '🏆' : '') + (r.tags.includes('best3') ? '💎' : '');
+    const tags = (r.tags.includes('top5') ? '🏆' : '') + (r.tags.includes('best10') ? '🔟' : '') + (r.tags.includes('best3') ? '💎' : '');
     t += `${icon} ${fmtDate(r.utc)} ${tags} <b>${esc(r.home)} vs ${esc(r.away)}</b> — ${esc(label)} (${sign[k]})` +
       (r.odds ? ` @ ${r.odds[k].toFixed(2)}` : '') + (r.res ? ` · result ${sign[r.res]}${r.score ? ' (' + r.score + ')' : ''}` : '') + '\n';
   }
@@ -1498,7 +1501,8 @@ const PLANS = {
   month: { label: 'Monthly', days: 30, ngn: Number(process.env.PRICE_MONTH_NGN || 6000), stars: Number(process.env.STARS_MONTH || 350) },
 };
 const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 3);   // free users: match analyses / predictions per day
-const FREE_PICKS = Number(process.env.FREE_PICKS || 1);               // free users see this many Top 5 / Best 3 picks
+const FREE_PICKS = Number(process.env.FREE_PICKS || 1);               // (legacy) no longer used: Top 5 / Best 3 / Best 1 are Premium-only
+const BEST10_INCLUDES_TOP5 = process.env.BEST10_INCLUDES_TOP5 === 'on'; // default off: free Best 10 = next 10 picks AFTER the premium Top 5, so Premium picks are not given away
 const REF_BONUS_DAYS = Number(process.env.REF_BONUS_DAYS || 2);       // premium days the referrer earns per new user
 const REF_NEW_DAYS = Number(process.env.REF_NEW_DAYS || 1);           // premium days a referred new user gets
 const REF_MAX = Number(process.env.REF_MAX || 10);                    // max rewarded referrals per user
@@ -1575,7 +1579,7 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
-  "/today – today's matches & odds\n/top5 – top picks of the day\n/best3 – under-the-radar picks\n/value – value bets\n/acca – accumulator builder\n" +
+  "/today – today's matches & odds\n/best10 – 10 free picks of the day\n/top5 · /best3 · /best1 – top picks (Premium)\n/value – value bets\n/acca – accumulator builder\n" +
   '/goals · /dc – goals & safer markets\n/live · /table – scores & league tables\n/predict – any upcoming match\n/watchlist – matches you follow\n' +
   '/stake – stake calculator\n/subscribe – daily picks in your chat\n/premium – unlock everything\n/account · /refer · /settings · /lang\n' +
   '/stats · /history · /calibration – track record\n/help – how it works';
@@ -1594,7 +1598,7 @@ const TX = {
     none_prefs: '😴 Nothing qualifies inside your league / min-odds filters today. Adjust them in /settings.',
     locked_more: (n) => `${n} more pick${n > 1 ? 's' : ''} unlocked with Premium`,
     premium_only: '🔒 <b>Premium feature.</b> Upgrade to unlock it — pay with Telegram Stars or Paystack.',
-    limit_reached: (n) => `🔒 You've used your ${n} free analyses for today. Premium gives unlimited analyses, full Top 5 / Best 3, value bets, accas, daily push and kickoff alerts.`,
+    limit_reached: (n) => `🔒 You've used your ${n} free analyses for today. Premium gives unlimited analyses, Top 5 / Best 3 / Best 1, value bets, accas, daily push and kickoff alerts.`,
     upgrade: '⭐ Upgrade to Premium',
     plan_free: 'Free',
     plan_active: (d) => `Premium until ${d}`,
@@ -1898,7 +1902,7 @@ async function renderPage(page, u, day = 0) {
     nav.push(page < pages - 1 ? Markup.button.callback('Next ▶️', `pd:${day}:${page + 1}`) : Markup.button.callback('·', 'noop'));
     rows.push(nav);
   }
-  rows.push([Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3')]);
+  rows.push([Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3')]);
   rows.push([Markup.button.callback('📈 Value', 'value'), Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('🔴 Live', 'live')]);
   rows.push([Markup.button.callback('🔄 Refresh', `rf:${day}:${page}`), MENU_BTN]);
   return { text, kb: Markup.inlineKeyboard(rows) };
@@ -1996,7 +2000,7 @@ async function renderDetailFor(m, backData, u) {
   tx += '\n' + t(u, 'disc');
   const rows = [[Markup.button.callback('⭐ Watch', `w:${m.id}`), Markup.button.callback('🔁 H2H history', `h2h:${m.id}`)]];
   if (backData) rows.push([Markup.button.callback('⬅️ Back to list', backData)]);
-  rows.push([Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3'), MENU_BTN]);
+  rows.push([Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
 }
 
@@ -2018,6 +2022,22 @@ async function renderTop5(u, { full = true } = {}) {
   let kb = null;
   if (shown.length < top.length) { tx += `🔒 ${t(u, 'locked_more', top.length - shown.length)}\n\n`; kb = upgradeKb(u); }
   return { text: tx + t(u, 'disc'), kb, empty: false };
+}
+
+async function renderBest10(u) {
+  const all = (await computeBest10()).filter((x) => x.m.utc > Date.now());
+  const list = applyPrefs(all, u);
+  if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null, empty: true };
+  let tx = `🔟 <b>Best 10 picks today</b>\n<i>Free for everyone. Ranked by confidence, source agreement and value vs the market. The sharpest picks are in Premium (/top5 · /best3 · /best1).</i>\n\n`;
+  list.forEach(({ m, st, sc }, i) => {
+    const p = sc.pick;
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · confidence ${pct(p.p)}%\n`;
+    const r = reasonOf(m, st);
+    if (r) tx += `   <i>${esc(r)}</i>\n`;
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
+  });
+  return { text: tx + t(u, 'disc'), kb: upgradeKb(u), empty: false };
 }
 
 async function renderBest3(u, { full = true, only1 = false } = {}) {
@@ -2119,7 +2139,7 @@ async function renderAcca(u, mode = 'balanced', legsN = 3) {
   const kb = Markup.inlineKeyboard([
     ['safe', 'balanced', 'risky'].map((md) => Markup.button.callback((md === mode ? '• ' : '') + md[0].toUpperCase() + md.slice(1), `acca:${md}:${legsN}`)),
     [2, 3, 4, 5].map((n) => Markup.button.callback((n === legsN ? '• ' : '') + n + ' legs', `acca:${mode}:${n}`)),
-    [Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('⚽ Today', 'today'), MENU_BTN],
+    [Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('⚽ Today', 'today'), MENU_BTN],
   ]);
   if (legs.length < 2) return { text: `🎯 <b>Accumulator (${mode})</b>\n\nNot enough qualifying matches today for a ${mode} acca. Try another style or check back later.\n\n` + t(u, 'disc'), kb };
   let odds = 1, bestOdds = 1, prob = 1;
@@ -2296,7 +2316,7 @@ const langKb = () => Markup.inlineKeyboard([[Markup.button.callback('🇬🇧 En
 // ----- Premium screen -----
 function premiumView(u) {
   const line = (k) => `${PLANS[k].label} (${PLANS[k].days} days) — ` + [PAYSTACK_KEY ? '₦' + money(PLANS[k].ngn) : '', STARS_ON ? PLANS[k].stars + ' ⭐' : ''].filter(Boolean).join(' or ');
-  const tx = '⭐ <b>Premium</b>\n\nUnlock:\n• Full Top 5 &amp; Best 3 (free = ' + FREE_PICKS + ' pick each)\n• /value bets · /acca builder · /goals · /dc\n• Daily auto-push + kickoff alerts + result notifications\n• Unlimited match analysis &amp; /predict\n\n' +
+  const tx = '⭐ <b>Premium</b>\n\nUnlock:\n• 🏆 Top 5 · 💎 Best 3 · 🥇 Best 1 (free users get the 🔟 Best 10)\n• /value bets · /acca builder · /goals · /dc\n• Daily auto-push + kickoff alerts + result notifications\n• Unlimited match analysis &amp; /predict\n\n' +
     `🗓 ${line('week')}\n📅 ${line('month')}\n\nInvite friends with /refer to earn free days.`;
   const rows = [];
   if (STARS_ON) rows.push(['week', 'month'].map((k) => Markup.button.callback(`⭐ ${PLANS[k].label} · ${PLANS[k].stars}`, `buy:xtr:${k}`)));
@@ -2470,8 +2490,9 @@ async function applyReferral(ctx, refId) {
 
 // ----- basics -----
 const mainKb = (u) => Markup.inlineKeyboard([
-  [Markup.button.callback('⚽ Today', 'today'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3')],
-  [Markup.button.callback('📈 Value', 'value'), Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('🔴 Live', 'live')],
+  [Markup.button.callback('⚽ Today', 'today'), Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5')],
+  [Markup.button.callback('💎 Best 3', 'best3'), Markup.button.callback('🥇 Best 1', 'best1'), Markup.button.callback('📈 Value', 'value')],
+  [Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('🔴 Live', 'live')],
   [Markup.button.callback('📊 Tables', 'tbl'), Markup.button.callback('⭐ Watchlist', 'wl'), Markup.button.callback('⚙️ Settings', 'st')],
   [Markup.button.callback('💳 Premium', 'up'), Markup.button.callback('👤 Account', 'acct'), Markup.button.callback('❓ Help', 'help')],
 ]);
@@ -2480,8 +2501,9 @@ const MENU_BTN = Markup.button.callback('🏠 Menu', 'menu');
 const withNav = (kb, rows = []) => Markup.inlineKeyboard([...((kb && kb.reply_markup && kb.reply_markup.inline_keyboard) || []), ...rows, [MENU_BTN]]);
 const navKb = (rows = []) => withNav(null, rows);
 const replyMenu = Markup.keyboard([
-  ['⚽ Today', '🏆 Top 5', '💎 Best 3'],
-  ['📈 Value', '🎯 Acca', '🔴 Live'],
+  ['⚽ Today', '🔟 Best 10', '🏆 Top 5'],
+  ['💎 Best 3', '📈 Value', '🎯 Acca'],
+  ['🔴 Live'],
   ['📊 Tables', '⭐ Watchlist', '⚙️ Settings'],
   ['💳 Premium', '👤 Account', '❓ Help'],
 ]).resize();
@@ -2493,6 +2515,7 @@ const showToday = async (ctx) => {
 };
 const MENU_ACTIONS = {
   '⚽ Today': (ctx) => showToday(ctx),
+  '🔟 Best 10': (ctx) => picksHandler('best10')(ctx),
   '🏆 Top 5': (ctx) => picksHandler('top5')(ctx),
   '💎 Best 3': (ctx) => picksHandler('best3')(ctx),
   '📈 Value': (ctx) => (ctx.premium ? valueH(ctx) : paywall(ctx)),
@@ -2580,12 +2603,14 @@ bot.action(/^m:(\d+):(\d+)$/, async (ctx) => {
 
 // top 5 / best 3 (free users see FREE_PICKS)
 const picksHandler = (kind) => async (ctx) => {
-  const wait = await ctx.reply(t(ctx.u, kind === 'top5' ? 'wait_top5' : 'wait_best3'));
+  // Best 10 is free; Top 5 / Best 3 / Best 1 are Premium-only
+  if (kind !== 'best10' && !ctx.premium) return paywall(ctx, `🔒 <b>${{ top5: 'Top 5', best3: 'Best 3', best1: 'Best 1' }[kind]} is a Premium feature.</b>\nFree users get the 🔟 Best 10 picks (/best10). Upgrade to unlock the top-ranked picks.`);
+  const wait = await ctx.reply(t(ctx.u, kind === 'top5' || kind === 'best10' ? 'wait_top5' : 'wait_best3'));
   try {
     await ctx.sendChatAction('typing');
-    const r = await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: ctx.premium, only1: kind === 'best1' });
+    const r = kind === 'best10' ? await renderBest10(ctx.u) : await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: true, only1: kind === 'best1' });
     await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
-    const B = { top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1' };
+    const B = { best10: '🔟 Best 10', top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1' };
     const others = Object.keys(B).filter((x) => x !== kind).map((x) => Markup.button.callback(B[x], x));
     await replyLong(ctx, r.text, withNav(r.kb, [others, [Markup.button.callback('⚽ Today', 'today')]]));
   } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
@@ -2594,6 +2619,8 @@ bot.command('top5', detach(picksHandler('top5')));
 bot.command('best3', detach(picksHandler('best3')));
 bot.action('top5', async (ctx) => { await ctx.answerCbQuery(); picksHandler('top5')(ctx).catch(console.error); });
 bot.action('best3', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best3')(ctx).catch(console.error); });
+bot.command('best10', detach(picksHandler('best10')));
+bot.action('best10', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best10')(ctx).catch(console.error); });
 bot.command('best1', detach(picksHandler('best1')));
 bot.action('best1', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best1')(ctx).catch(console.error); });
 
@@ -2918,9 +2945,10 @@ process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
 const PUBLIC_COMMANDS = [
   { command: 'menu', description: 'Open the main menu' },
   { command: 'today', description: "Today's matches with odds" },
-  { command: 'top5', description: 'Top 5 picks of the day' },
-  { command: 'best3', description: 'Best 3 under-the-radar picks' },
-  { command: 'best1', description: 'Best single pick of the day' },
+  { command: 'best10', description: 'Best 10 picks of the day (free)' },
+  { command: 'top5', description: 'Top 5 picks of the day (Premium)' },
+  { command: 'best3', description: 'Best 3 under-the-radar picks (Premium)' },
+  { command: 'best1', description: 'Best single pick of the day (Premium)' },
   { command: 'value', description: 'Value bets (Premium)' },
   { command: 'acca', description: 'Accumulator builder (Premium)' },
   { command: 'goals', description: 'Goals markets (Premium)' },
