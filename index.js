@@ -1318,7 +1318,10 @@ function logPrediction(m, st, tag) {
   if (r.res) return;
   r.mkt = hda(m.odds.probs); r.form = hda(st.form); r.ai = st.ai ? hda(st.ai.probs) : null; r.final = hda(st.final);
   r.odds = hda(m.odds.odds); r.best = hda(m.odds.best); // prices at the time of the pick (for ROI tracking)
-  if (tag && !r.tags.includes(tag)) r.tags.push(tag);
+  if (tag && !r.tags.includes(tag)) {
+    r.tags.push(tag);
+    if (!r.pubPick) { r.pubPick = argmax(st.final); r.pubOdds = hda(m.odds.odds); } // odds + side at the moment we first published it
+  }
   predDirty.add(r.id);
   savePredLog();
 }
@@ -1497,6 +1500,7 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL ||
 const PAYSTACK_EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || 'footballprediction.com'; // Telegram gives no email; Paystack needs one
 const STARS_ON = process.env.STARS !== 'off';
 const PLANS = {
+  day: { label: 'Day pass', days: 1, ngn: Number(process.env.PRICE_DAY_NGN || 500), stars: Number(process.env.STARS_DAY || 30) },
   week: { label: 'Weekly', days: 7, ngn: Number(process.env.PRICE_WEEK_NGN || 2000), stars: Number(process.env.STARS_WEEK || 100) },
   month: { label: 'Monthly', days: 30, ngn: Number(process.env.PRICE_MONTH_NGN || 6000), stars: Number(process.env.STARS_MONTH || 350) },
 };
@@ -1506,6 +1510,15 @@ const BEST10_INCLUDES_TOP5 = process.env.BEST10_INCLUDES_TOP5 === 'on'; // defau
 const REF_BONUS_DAYS = Number(process.env.REF_BONUS_DAYS || 2);       // premium days the referrer earns per new user
 const REF_NEW_DAYS = Number(process.env.REF_NEW_DAYS || 1);           // premium days a referred new user gets
 const REF_MAX = Number(process.env.REF_MAX || 10);                    // max rewarded referrals per user
+const REF_PAID_DAYS = Number(process.env.REF_PAID_DAYS || 3);         // extra days when a friend you invited PAYS for the first time
+const REF_PAID_MAX = Number(process.env.REF_PAID_MAX || 20);          // max rewarded paying referrals per user
+const REF_MILESTONE_N = Number(process.env.REF_MILESTONE_N || 3);     // every N paying friends = milestone bonus
+const REF_MILESTONE_DAYS = Number(process.env.REF_MILESTONE_DAYS || 7);
+const TEASER_HOUR = Number(process.env.TEASER_HOUR || 9);             // free daily tips are sent from this local hour (user's timezone)
+const STALE_DRIFT = Number(process.env.STALE_DRIFT || 0.1);           // price-move alert when a published pick's odds move this much (10%)
+const SAFE_TARGET_ODDS = Number(process.env.SAFE_TARGET_ODDS || 2.0); // /safe builds the safest slip reaching these combined odds
+const MAX_FOLLOW_DAY = Number(process.env.MAX_FOLLOW_DAY || 30);      // picks a user can follow per day
+const LB_MIN_PICKS = Number(process.env.LB_MIN_PICKS || 5);           // settled followed picks needed to enter the leaderboard
 const VALUE_MIN_EDGE = Number(process.env.VALUE_MIN_EDGE || 0.03);    // model prob must beat the market by this much
 const VALUE_MIN_EV = Number(process.env.VALUE_MIN_EV || 0.05);        // and expected value at the best price must be at least +5%
 const VALUE_MAX_ODDS = Number(process.env.VALUE_MAX_ODDS || 6);       // ignore long shots
@@ -1539,6 +1552,20 @@ async function initDb() {
   await q(`CREATE TABLE IF NOT EXISTS predictions (id BIGINT PRIMARY KEY, data JSONB NOT NULL)`);
   await q(`CREATE INDEX IF NOT EXISTS users_sub_idx ON users (sub_daily) WHERE sub_daily`);
   await q(`CREATE INDEX IF NOT EXISTS watch_open_idx ON watch (utc) WHERE NOT ko_sent OR NOT res_sent`);
+  // --- feature pack: self-exclusion, free tips, follows, promo codes ---
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS excluded_until TIMESTAMPTZ`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS teaser_daily BOOLEAN DEFAULT true`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_teaser DATE`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS expired_notified BOOLEAN DEFAULT false`);
+  await q(`CREATE TABLE IF NOT EXISTS followed (
+    user_id BIGINT, match_id BIGINT, home TEXT, away TEXT, utc BIGINT, pick TEXT, label TEXT, odds NUMERIC,
+    res TEXT, won BOOLEAN, profit NUMERIC, created_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (user_id, match_id))`);
+  await q(`CREATE INDEX IF NOT EXISTS followed_open_idx ON followed (utc) WHERE won IS NULL`);
+  await q(`CREATE TABLE IF NOT EXISTS promo_codes (
+    code TEXT PRIMARY KEY, days INT NOT NULL, max_uses INT NOT NULL DEFAULT 1, uses INT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+  await q(`CREATE TABLE IF NOT EXISTS promo_redemptions (
+    code TEXT, user_id BIGINT, redeemed_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (code, user_id))`);
   dbReady = true;
 }
 
@@ -1579,13 +1606,13 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
-  "/today – today's matches & odds\n/best10 – 10 free picks of the day\n/top5 · /best3 · /best1 – top picks (Premium)\n/value – value bets\n/acca – accumulator builder\n" +
-  '/goals · /dc – goals & safer markets\n/live · /table – scores & league tables\n/predict – any upcoming match\n/watchlist – matches you follow\n' +
-  '/stake – stake calculator\n/subscribe – daily picks in your chat\n/premium – unlock everything\n/account · /refer · /settings · /lang\n' +
-  '/stats · /history · /calibration – track record\n/help – how it works';
+  "/menu – main menu\n/best10 – 10 free picks · /picks – all pick lists\n/top5 · /best3 · /best1 – top picks (Premium)\n/best10pro · /potw – Pro list &amp; pick of the week (Premium)\n" +
+  '/today · /live · /table · /predict\n/value · /goals · /dc · /scores – markets (Premium)\n/acca · /safe · /weekend – accumulators (Premium)\n' +
+  '/myrecord · /leaders – track your picks\n/watchlist · /subscribe · /stake\n/premium · /redeem · /refer · /account · /settings · /lang\n' +
+  '/stats · /history · /calibration – model track record\n/responsible – stay in control · /help';
 const TX = {
   en: {
-    start: (n) => `👋 <b>Welcome${n ? ', ' + esc(n) : ''}!</b>\n\n⚽ <b>Football Predictions Bot</b>\nBookmaker odds + a goal model + AI, blended into daily picks.\n\n${CMD_LIST}`,
+    start: (n) => `👋 <b>Welcome${n ? ', ' + esc(n) : ''}!</b>\n\n⚽ <b>Football Predictions Bot</b>\nBookmaker odds + a goal model + AI, blended into daily picks.\n\n🆓 <b>Free:</b> 🔟 Best 10 every day.\n💎 <b>Premium:</b> Top 5, Best 3, Best 1, value bets, accas and more.\n\nTap a section below to begin 👇`,
     wait_top5: '🔎 Analysing today\'s matches… the first run can take a minute or two.',
     wait_best3: '💎 Hunting for under-the-radar picks… the first run can take a minute or two.',
     wait_generic: '⏳ Crunching the numbers… this can take a minute on the first run.',
@@ -1612,7 +1639,7 @@ const TX = {
     disc: DISCLAIMER_EN(),
   },
   pcm: {
-    start: (n) => `👋 <b>Welcome${n ? ', ' + esc(n) : ''}!</b>\n\n⚽ <b>Football Predictions Bot</b>\nWe mix bookmaker odds, goal model and AI to give you correct picks every day.\n\n${CMD_LIST}`,
+    start: (n) => `👋 <b>Welcome${n ? ', ' + esc(n) : ''}!</b>\n\n⚽ <b>Football Predictions Bot</b>\nWe mix bookmaker odds, goal model and AI to give you correct picks every day.\n\n🆓 <b>Free:</b> Best 10 every day.\n💎 <b>Premium:</b> Top 5, Best 3, Best 1, value bets, accas and more.\n\nTap one section below to start 👇`,
     wait_top5: '🔎 I dey check today matches… first time fit take small minute.',
     wait_best3: '💎 I dey find the hidden gems… first time fit take small minute.',
     wait_generic: '⏳ I dey do the maths… e fit take small minute.',
@@ -1639,7 +1666,7 @@ const TX = {
     disc: '⚠️ <i>Na estimate be this, no be guarantee. Odds fit differ for your bookie. 18+ · bet wisely.</i>',
   },
   fr: {
-    start: (n) => `👋 <b>Bienvenue${n ? ', ' + esc(n) : ''} !</b>\n\n⚽ <b>Bot de pronostics football</b>\nCotes des bookmakers + modèle de buts + IA, combinés en pronostics quotidiens.\n\n${CMD_LIST}`,
+    start: (n) => `👋 <b>Bienvenue${n ? ', ' + esc(n) : ''} !</b>\n\n⚽ <b>Bot de pronostics football</b>\nCotes des bookmakers + modèle de buts + IA, combinés en pronostics quotidiens.\n\n🆓 <b>Gratuit :</b> Best 10 chaque jour.\n💎 <b>Premium :</b> Top 5, Best 3, Best 1, value bets, combinés et plus.\n\nChoisissez une section ci-dessous 👇`,
     wait_top5: '🔎 Analyse des matchs du jour… la première fois peut prendre une ou deux minutes.',
     wait_best3: '💎 Recherche de pronostics sous le radar… la première fois peut prendre une ou deux minutes.',
     wait_generic: '⏳ Calculs en cours… cela peut prendre une minute la première fois.',
@@ -1688,7 +1715,7 @@ async function updUser(id, fields) {
 }
 async function grantDays(userId, days) {
   const { rows } = await q(
-    `UPDATE users SET plan_until = GREATEST(COALESCE(plan_until, now()), now()) + make_interval(days => $2::int), warned_exp = false
+    `UPDATE users SET plan_until = GREATEST(COALESCE(plan_until, now()), now()) + make_interval(days => $2::int), warned_exp = false, expired_notified = false
      WHERE id = $1 RETURNING *`, [userId, Math.round(days)]);
   return rows[0] || null;
 }
@@ -1725,8 +1752,27 @@ async function activatePlan(userId, planKey, provider, amount, currency) {
   const u = await grantDays(userId, plan.days);
   if (!u) return null;
   await sendTo(userId, t(u, 'paid_ok', plan.label, fmtUntil(u.plan_until)), { reply_markup: undefined });
+  creditReferrer(u).catch((e) => console.log('Referral credit failed:', e.message));
   notifyAdmins(`💰 <b>New payment</b>: ${esc(u.first_name || '')} (<code>${userId}</code>) · ${plan.label} · ${provider} ${currency === 'XTR' ? amount + ' ⭐' : '₦' + money(amount)}`).catch(() => {});
   return u;
+}
+
+// Referrer earns bonus days when an invited friend pays for the first time (+ a milestone bonus every N paying friends)
+async function creditReferrer(u) {
+  if (!u.referred_by) return;
+  const mine = (await q(`SELECT count(*)::int AS n FROM payments WHERE user_id = $1 AND status = 'success'`, [u.id])).rows[0].n;
+  if (mine !== 1) return; // only the friend's FIRST payment counts
+  const paying = (await q(`SELECT count(DISTINCT p.user_id)::int AS n FROM payments p JOIN users x ON x.id = p.user_id WHERE x.referred_by = $1 AND p.status = 'success'`, [u.referred_by])).rows[0].n;
+  if (paying > REF_PAID_MAX) return;
+  let days = REF_PAID_DAYS;
+  let msg = `💎 A friend you invited just went Premium — <b>+${REF_PAID_DAYS} days</b> for you!`;
+  if (REF_MILESTONE_N > 0 && paying % REF_MILESTONE_N === 0) {
+    days += REF_MILESTONE_DAYS;
+    msg += `\n🏅 Milestone: <b>${paying} paying friends</b> — bonus <b>+${REF_MILESTONE_DAYS} days</b>!`;
+  }
+  if (days <= 0) return;
+  const ru = await grantDays(u.referred_by, days);
+  if (ru) await sendTo(u.referred_by, msg + `\nYour Premium now runs until ${fmtUntil(ru.plan_until)}.`);
 }
 
 // --- Telegram Stars (currency XTR, no provider token) ---
@@ -2010,34 +2056,34 @@ async function renderTop5(u, { full = true } = {}) {
   const top = applyPrefs(all, u);
   if (!top.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null, empty: true };
   const shown = full ? top : top.slice(0, FREE_PICKS);
-  let tx = `🏆 <b>${t(u, 'top5_head')}</b>\n<i>${t(u, 'top5_sub')}</i>\n\n`;
+  let tx = `🏆 <b>${t(u, 'top5_head')}</b>\n<i>${t(u, 'top5_sub')}</i>\n\n${FOLLOW_HINT}`;
   shown.forEach(({ m, st, sc }, i) => {
     const p = sc.pick;
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · confidence ${pct(p.p)}%\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
     tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
   });
   let kb = null;
   if (shown.length < top.length) { tx += `🔒 ${t(u, 'locked_more', top.length - shown.length)}\n\n`; kb = upgradeKb(u); }
-  return { text: tx + t(u, 'disc'), kb, empty: false };
+  return { text: tx + t(u, 'disc'), kb: followKb(shown, kb), empty: false };
 }
 
 async function renderBest10(u) {
   const all = (await computeBest10()).filter((x) => x.m.utc > Date.now());
   const list = applyPrefs(all, u);
   if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null, empty: true };
-  let tx = `🔟 <b>Best 10 picks today</b>\n<i>Free for everyone. Ranked by confidence, source agreement and value vs the market. The sharpest picks are in Premium (/top5 · /best3 · /best1).</i>\n\n`;
+  let tx = `🔟 <b>Best 10 picks today</b>\n<i>Free for everyone. Ranked by confidence, source agreement and value vs the market. The sharpest picks are in Premium (/top5 · /best3 · /best1).</i>\n\n${FOLLOW_HINT}`;
   list.forEach(({ m, st, sc }, i) => {
     const p = sc.pick;
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · confidence ${pct(p.p)}%\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
     tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
   });
-  return { text: tx + t(u, 'disc'), kb: upgradeKb(u), empty: false };
+  return { text: tx + t(u, 'disc'), kb: followKb(list, u && hasPremium(u) ? null : quickBuyKb()), empty: false };
 }
 
 async function renderBest3(u, { full = true, only1 = false } = {}) {
@@ -2056,12 +2102,13 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
     if (list.length < 3) tx += `<i>Only ${list.length} match${list.length > 1 ? 'es' : ''} had usable odds today.</i>\n`;
     tx += '\n';
   }
+  tx += FOLLOW_HINT;
   const medal = ['🥇', '🥈', '🥉'];
   shown.forEach(({ m, st, sc, tier }, i) => {
     const p = sc.pick;
     const k = p.k;
     tx += `${medal[i] || i + 1 + '.'} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · confidence ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence · ${sc.agreeN}/${sc.total} sources agree\n`;
     tx += `   📊 Market ${pct(m.odds.probs[k])}%` + (st.form ? ` · Form model ${pct(st.form[k])}%` : '') + (st.ai ? ` · AI ${pct(st.ai.probs[k])}%` : '') + '\n';
     const tl = (name, pr) =>
       `${esc(name)} #${pr.rank || '?'}` + (pr.venue.n ? ` (${f1(pr.venue.ppg)} pts/g ${pr === st.hp ? 'home' : 'away'}, ${f1(pr.venue.gf)}-${f1(pr.venue.ga)} goals/g)` : '');
@@ -2075,7 +2122,7 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
   });
   let kb = null;
   if (!only1 && shown.length < list.length) { tx += `🔒 ${t(u, 'locked_more', list.length - shown.length)}\n\n`; kb = upgradeKb(u); }
-  return { text: tx + t(u, 'disc'), kb, empty: false };
+  return { text: tx + t(u, 'disc'), kb: followKb(shown, kb), empty: false };
 }
 
 // ----- Value bets: model probability vs the BEST bookmaker price -----
@@ -2282,6 +2329,8 @@ async function renderAccount(ctx) {
   tx += ctx.isAdmin ? '🛡 Plan: <b>Admin — all features unlocked</b>\n' : `⭐ Plan: <b>${ctx.premium ? t(u, 'plan_active', fmtUntil(u.plan_until)) : t(u, 'plan_free')}</b>\n`;
   if (!ctx.premium) tx += `🆓 Free analyses today: ${Math.min(used, FREE_DAILY_LIMIT)}/${FREE_DAILY_LIMIT}\n`;
   tx += `🔔 Daily picks: ${u.sub_daily ? 'ON' : 'off'}\n👥 Referrals: ${refs}\n`;
+  if (u.excluded_until && new Date(u.excluded_until) > new Date()) tx += `⛔ Self-exclusion until ${fmtUntil(u.excluded_until)}\n`;
+  tx += '\n🎟 /redeem a promo code · 🎁 /refer for free days · 📌 /myrecord · 🛡 /responsible';
   return tx;
 }
 function settingsView(u, premium) {
@@ -2292,11 +2341,13 @@ function settingsView(u, premium) {
     `🎚 Min pick odds: <b>${Number(u.min_odds) > 0 ? Number(u.min_odds).toFixed(2) : 'none'}</b> (/minodds 1.5)\n` +
     `💵 Bankroll: <b>${u.bankroll ? money(u.bankroll) : 'not set'}</b> (/bankroll 50000) · Kelly fraction <b>${Math.round((Number(u.kelly) || 0.25) * 100)}%</b> (/kelly 0.25)\n` +
     `🌍 Language: <b>${{ en: 'English', pcm: 'Pidgin', fr: 'Français' }[u.lang] || 'English'}</b>\n` +
+    (premium ? '' : `📬 Free daily tips: <b>${u.teaser_daily ? 'ON' : 'off'}</b> (${String(TEASER_HOUR).padStart(2, '0')}:00)\n`) +
     (premium ? '' : '\n<i>Daily push needs Premium.</i>');
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback(u.sub_daily ? '🔕 Turn daily picks off' : '🔔 Turn daily picks on', 'set:sub')],
     [Markup.button.callback('🕘 −1h', 'set:h-'), Markup.button.callback('🕘 +1h', 'set:h+'), Markup.button.callback('🏆 Leagues', 'set:lg')],
-    [Markup.button.callback('🌍 Language', 'set:lang')],
+    [Markup.button.callback('🌍 Language', 'set:lang'), Markup.button.callback('🛡 Responsible', 'resp')],
+    ...(premium ? [] : [[Markup.button.callback(u.teaser_daily ? '📬 Free tips: ON ✅' : '📬 Free tips: off', 'tsr:toggle')]]),
     [MENU_BTN],
   ]);
   return { text: tx, kb };
@@ -2315,13 +2366,20 @@ const langKb = () => Markup.inlineKeyboard([[Markup.button.callback('🇬🇧 En
 
 // ----- Premium screen -----
 function premiumView(u) {
-  const line = (k) => `${PLANS[k].label} (${PLANS[k].days} days) — ` + [PAYSTACK_KEY ? '₦' + money(PLANS[k].ngn) : '', STARS_ON ? PLANS[k].stars + ' ⭐' : ''].filter(Boolean).join(' or ');
-  const tx = '⭐ <b>Premium</b>\n\nUnlock:\n• 🏆 Top 5 · 💎 Best 3 · 🥇 Best 1 (free users get the 🔟 Best 10)\n• /value bets · /acca builder · /goals · /dc\n• Daily auto-push + kickoff alerts + result notifications\n• Unlimited match analysis &amp; /predict\n\n' +
-    `🗓 ${line('week')}\n📅 ${line('month')}\n\nInvite friends with /refer to earn free days.`;
-  const rows = [];
-  if (STARS_ON) rows.push(['week', 'month'].map((k) => Markup.button.callback(`⭐ ${PLANS[k].label} · ${PLANS[k].stars}`, `buy:xtr:${k}`)));
-  if (PAYSTACK_KEY) rows.push(['week', 'month'].map((k) => Markup.button.callback(`💳 ${PLANS[k].label} · ₦${money(PLANS[k].ngn)}`, `buy:ps:${k}`)));
-  rows.push([MENU_BTN]);
+  const keys = Object.keys(PLANS);
+  const perDay = (k) => PLANS[k].ngn / PLANS[k].days;
+  const save = (k) => Math.round((1 - perDay(k) / perDay('day')) * 100);
+  const price = (k) => [PAYSTACK_KEY ? '₦' + money(PLANS[k].ngn) : '', STARS_ON ? PLANS[k].stars + ' ⭐' : ''].filter(Boolean).join(' or ');
+  const icon = { day: '🎟', week: '📅', month: '🔥' };
+  const proof = proofLine();
+  const active = hasPremium(u) && !isAdminId(u.id);
+  let tx = '💎 <b>Premium</b>\n━━━━━━━━━━━━━━\n' + (active ? `✅ Active until <b>${fmtUntil(u.plan_until)}</b> — renew any time to add days.\n\n` : '') +
+    '🏆 Top 5 · 💎 Best 3 · 🥇 Best 1\n🔟⭐ Best 10 Pro · 🌟 Pick of the Week\n📈 Value · ⚽ Goals · 🛡 Double chance · 🎯 Correct score\n🎯 Accas · 🛡 Safe slip · 🏖 Weekend special\n🔔 Daily push + kickoff, result &amp; price-move alerts\n♾ Unlimited match analysis and /predict\n\n';
+  if (proof) tx += proof + '\n<i>Past results don\'t guarantee future results.</i>\n\n';
+  tx += keys.map((k) => `${icon[k] || '⭐'} <b>${PLANS[k].label}</b> (${PLANS[k].days} day${PLANS[k].days > 1 ? 's' : ''}) — ${price(k)}${k !== 'day' && save(k) > 0 ? ` · <i>save ${save(k)}%</i>` : ''}`).join('\n');
+  tx += '\n\n🎁 Earn free days with /refer · 🎟 Have a promo code? /redeem';
+  const rows = buyRows();
+  rows.push([Markup.button.callback('🎟 Promo code', 'redeem'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
 }
 
@@ -2346,13 +2404,371 @@ async function renderWatchlist(u) {
   return { text: tx, kb: withNav(Markup.inlineKeyboard([btns])) };
 }
 
+// =====================================================================
+//  FEATURE PACK — conversion, new pick types, engagement, safety, navigation
+// =====================================================================
+const isUpcoming = (x) => x.m.utc > Date.now();
+const tierOf = (p) => (p >= 0.6 ? '🟢 High' : p >= 0.5 ? '🟡 Medium' : '🟠 Lower');
+const dotOf = (p) => tierOf(p).split(' ')[0];
+const pickName = (home, away, k) => (k === 'H' ? `${home} win` : k === 'A' ? `${away} win` : 'Draw');
+const FOLLOW_HINT = '📌 <i>Tap a number below to follow a pick — I\'ll message you the result and track your record (/myrecord).</i>\n\n';
+const LEGEND = '<i>🟢 High (60%+) · 🟡 Medium (50–60%) · 🟠 Lower (under 50%)</i>\n';
+
+// ----- track record used as social proof (Premium picks only, last N days) -----
+function proofLine(days = 30) {
+  const since = Date.now() - days * 864e5;
+  const rows = predLog.filter((r) => r.res && r.final && r.tags && (r.tags.includes('top5') || r.tags.includes('best3')) && r.utc > since);
+  if (rows.length < 5) return '';
+  const hit = rows.filter((r) => argmax(r.final) === r.res).length;
+  const ro = roiOf(rows);
+  return `📈 Premium picks, last ${days} days: <b>${hit}/${rows.length}</b> correct (${pct(hit / rows.length)}%)` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
+}
+
+// ----- keyboards: follow buttons, buy buttons -----
+function followKb(shown, kb) {
+  const base = (kb && kb.reply_markup && kb.reply_markup.inline_keyboard) || [];
+  const btns = shown.map((x, i) => Markup.button.callback(`📌 ${i + 1}`, `fp:${x.m.id}`));
+  const rows = [];
+  for (let i = 0; i < btns.length; i += 5) rows.push(btns.slice(i, i + 5));
+  return Markup.inlineKeyboard([...rows, ...base]);
+}
+function buyRows() {
+  const rows = [];
+  for (const k of Object.keys(PLANS)) {
+    const p = PLANS[k], row = [];
+    if (STARS_ON) row.push(Markup.button.callback(`⭐ ${p.label} · ${p.stars}`, `buy:xtr:${k}`));
+    if (PAYSTACK_KEY) row.push(Markup.button.callback(`💳 ${p.label} · ₦${money(p.ngn)}`, `buy:ps:${k}`));
+    if (row.length) rows.push(row);
+  }
+  return rows;
+}
+function renewKb() {
+  const rows = buyRows();
+  if (!rows.length) rows.push([Markup.button.callback('💎 See plans', 'up')]);
+  return Markup.inlineKeyboard(rows);
+}
+function quickBuyKb() {
+  const p = PLANS.day, row = [];
+  if (STARS_ON) row.push(Markup.button.callback(`⭐ Day pass · ${p.stars}`, 'buy:xtr:day'));
+  if (PAYSTACK_KEY) row.push(Markup.button.callback(`💳 Day pass · ₦${money(p.ngn)}`, 'buy:ps:day'));
+  const rows = row.length ? [row] : [];
+  rows.push([Markup.button.callback('💎 See all plans', 'up')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+// ----- locked-pick teaser: free users see WHICH matches are picked, not the pick itself -----
+async function renderTeaser(u, kind) {
+  const now = Date.now();
+  let rows;
+  if (kind === 'top5') rows = (await computeTop5()).filter((x) => x.m.utc > now);
+  else {
+    const b3 = await computeBest3();
+    rows = b3.list.filter((x) => x.m.utc > now);
+    if (kind === 'best1') rows = rows.slice(0, 1);
+  }
+  rows = applyPrefs(rows, u);
+  const head = { top5: '🏆 <b>Top 5 picks</b>', best3: '💎 <b>Best 3 — under-the-radar</b>', best1: '🥇 <b>Best pick of the day</b>' }[kind];
+  const proof = proofLine();
+  if (!rows.length) return { text: `${head}\n━━━━━━━━━━━━━━\n🔒 <b>Premium feature.</b> Today's picks aren't ready yet — Premium members see them the moment they are.\n\n🆓 Free today: /best10` + (proof ? `\n\n${proof}` : ''), kb: quickBuyKb() };
+  let tx = `${head}\n━━━━━━━━━━━━━━\n`;
+  rows.forEach(({ m, sc }, i) => {
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n   👉 🔒 <i>Pick hidden</i> · ${tierOf(sc.pick.p)}\n`;
+  });
+  tx += `\n🔓 <b>Unlock ${rows.length === 1 ? 'this pick' : 'all ' + rows.length + ' picks'} with Premium</b> — from ₦${money(PLANS.day.ngn)} for a day pass.\n`;
+  if (proof) tx += `\n${proof}\n<i>Past results don't guarantee future results.</i>\n`;
+  tx += '\n🆓 Free today: /best10';
+  return { text: tx, kb: quickBuyKb() };
+}
+
+// ----- Best 10 Pro (Premium): the 10 top-ranked picks with confidence tiers + model breakdown -----
+async function renderBest10Pro(u) {
+  const all = (await computeRanked()).filter(isUpcoming);
+  const list = applyPrefs(all, u).slice(0, 10);
+  if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null };
+  let tx = '🔟⭐ <b>Best 10 Pro</b>\n<i>The 10 highest-ranked picks today, with confidence tiers and the model breakdown.</i>\n' + LEGEND + '\n' + FOLLOW_HINT;
+  list.forEach(({ m, st, sc }, i) => {
+    const p = sc.pick, k = p.k;
+    tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
+    tx += `   📊 Market ${pct(m.odds.probs[k])}%` + (st.form ? ` · Form ${pct(st.form[k])}%` : '') + (st.ai ? ` · AI ${pct(st.ai.probs[k])}%` : '') + '\n';
+    if (st.mk && st.form) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
+    const r = reasonOf(m, st);
+    if (r) tx += `   <i>${esc(r)}</i>\n`;
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
+  });
+  return { text: tx + t(u, 'disc'), kb: followKb(list, null) };
+}
+
+// ----- Safe slip (Premium): safest combination of 1-3 picks that reaches the target combined odds -----
+async function renderSafe(u) {
+  const pool = byLeague(await accaPool(), u)
+    .filter((x) => x.sc.pick.p >= 0.5 && x.sc.pick.odds >= MIN_PICK_ODDS)
+    .sort((a, b) => b.sc.pick.p - a.sc.pick.p)
+    .slice(0, 10);
+  let best = null;
+  const tryCombo = (legs) => {
+    const odds = legs.reduce((a, x) => a * x.sc.pick.odds, 1);
+    const prob = legs.reduce((a, x) => a * x.sc.pick.p, 1);
+    if (odds < SAFE_TARGET_ODDS) return;
+    if (!best || prob > best.prob + 1e-9 || (Math.abs(prob - best.prob) < 1e-9 && legs.length < best.legs.length)) best = { legs, odds, prob };
+  };
+  for (let i = 0; i < pool.length; i++) {
+    tryCombo([pool[i]]);
+    for (let j = i + 1; j < pool.length; j++) {
+      tryCombo([pool[i], pool[j]]);
+      for (let k = j + 1; k < pool.length; k++) tryCombo([pool[i], pool[j], pool[k]]);
+    }
+  }
+  if (!best) return { text: `🛡 <b>Safe ${SAFE_TARGET_ODDS.toFixed(1)}-odds slip</b>\n\nNo safe combination reaches ${SAFE_TARGET_ODDS.toFixed(1)} odds today. Check back later, or try /acca safe.\n\n` + t(u, 'disc'), kb: null };
+  let tx = `🛡 <b>Safe ${SAFE_TARGET_ODDS.toFixed(1)}-odds slip</b>\n<i>The most likely combination of up to 3 picks that still reaches ${SAFE_TARGET_ODDS.toFixed(1)} total odds.</i>\n\n` + FOLLOW_HINT;
+  best.legs.forEach(({ m, sc }, i) => {
+    const p = sc.pick;
+    tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)} · ${pct(p.p)}%\n`;
+  });
+  tx += `\n📦 Combined odds: <b>${best.odds.toFixed(2)}</b> · 🎲 Chance all land: <b>${(best.prob * 100).toFixed(1)}%</b> · EV ${signed((best.prob * best.odds - 1) * 100, 0)}%` + stakeTxt(u, best.prob, best.odds) + '\n\n';
+  tx += '<i>Even the safest slip loses often enough — keep stakes small.</i>\n\n' + t(u, 'disc');
+  return { text: tx, kb: followKb(best.legs, null) };
+}
+
+// ----- Correct-score suggestions (Premium) from the goal model -----
+async function renderScores(u) {
+  const rows = [];
+  for (const { m, st } of byLeague(await analysedToday(), u)) {
+    if (!st.form) continue;
+    const all = [];
+    scoreGrid(st.form.lh, st.form.la).forEach((row, i) => row.forEach((p, j) => all.push({ s: `${i}-${j}`, p })));
+    all.sort((a, b) => b.p - a.p);
+    rows.push({ m, st, top: all.slice(0, 3) });
+  }
+  rows.sort((a, b) => b.top[0].p - a.top[0].p);
+  if (!rows.length) return '🎯 <b>Correct score</b>\n\nNot enough goal-model data today.\n\n' + t(u, 'disc');
+  let tx = '🎯 <b>Correct-score suggestions</b>\n<i>From the Dixon-Coles goal model. Correct score is high-variance — even the likeliest score lands only ~10–15% of the time, so stake small.</i>\n\n';
+  rows.slice(0, 8).forEach(({ m, st, top }, i) => {
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)} · ${esc(m.compName)}\n   🎯 ` + top.map((x, j) => `${j === 0 ? '<b>' + x.s + '</b>' : x.s} (${(x.p * 100).toFixed(0)}% · fair ${fair(x.p)})`).join(' · ') + `\n   ⚽ Expected goals ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)}\n\n`;
+  });
+  return tx + t(u, 'disc');
+}
+
+// ----- Pick of the Week (Premium): best Top-5 pick of the last 7 days (+ best one still to play) -----
+function renderPotw(u) {
+  const since = Date.now() - 7 * 864e5, now = Date.now();
+  const rows = predLog
+    .filter((r) => r.final && r.tags && r.tags.includes('top5') && r.utc > since)
+    .map((r) => { const k = r.pubPick || argmax(r.final); const o = (r.pubOdds || r.odds || {})[k]; return { r, k, o, p: r.final[k] }; })
+    .filter((x) => x.o && x.o >= MIN_PICK_ODDS);
+  if (!rows.length) return { text: '🌟 <b>Pick of the Week</b>\n\nNo qualifying Top 5 pick in the last 7 days yet. Check back after the next Top 5.', kb: null };
+  const line = ({ r, k, o, p }) => {
+    const icon = !r.res ? '⏳' : r.res === k ? '✅' : '❌';
+    return `${icon} <b>${esc(r.home)} vs ${esc(r.away)}</b>\n   🕒 ${fmtDate(r.utc)} ${fmtTime(r.utc)} · ${esc(LEAGUE_NAMES[r.comp] || r.comp)}\n   👉 <b>${esc(pickName(r.home, r.away, k))}</b> (${sign1x2[k]}) @ ${o.toFixed(2)} · ${dotOf(p)} ${pct(p)}%\n`;
+  };
+  const best = rows.slice().sort((a, b) => b.p - a.p)[0];
+  const upc = rows.filter((x) => !x.r.res && x.r.utc > now).sort((a, b) => b.p - a.p)[0];
+  let tx = '🌟 <b>Pick of the Week</b>\n<i>The highest-confidence Top 5 pick published in the last 7 days.</i>\n\n' + line(best);
+  if (upc && upc.r.id !== best.r.id) tx += '\n⏭ <b>Best pick still to play</b>\n' + line(upc);
+  return { text: tx + '\n' + t(u, 'disc'), kb: null };
+}
+
+// ----- Weekend special (Premium): 4-leg accumulator on Fri / Sat / Sun -----
+async function renderWeekend(u) {
+  const wd = new Intl.DateTimeFormat('en-US', { timeZone: TZ, weekday: 'short' }).format(new Date());
+  if (!['Fri', 'Sat', 'Sun'].includes(wd)) return { text: '🏖 <b>Weekend special</b>\n\nThe weekend accumulator opens on <b>Friday</b>: a 4-leg slip built from that day\'s strongest picks. Meanwhile, try /safe for today\'s safest slip.', kb: null };
+  const r = await renderAcca(u, 'balanced', 4);
+  return { text: r.text.replace(/🎯 <b>(\d)-leg accumulator — balanced<\/b>/, '🏖 <b>Weekend special — $1-leg accumulator</b>'), kb: null };
+}
+
+// ----- Engagement: personal record + leaderboard -----
+async function renderMyRecord(u) {
+  const s = (await q(`SELECT count(*) FILTER (WHERE won IS NOT NULL)::int AS n, count(*) FILTER (WHERE won)::int AS w,
+    COALESCE(sum(profit), 0) AS profit, count(*) FILTER (WHERE won IS NULL)::int AS pending FROM followed WHERE user_id = $1`, [u.id])).rows[0] || { n: 0, w: 0, profit: 0, pending: 0 };
+  if (!s.n && !s.pending) return { text: '📌 <b>My record</b>\n━━━━━━━━━━━━━━\nYou are not following any picks yet.\n\nOpen /best10 (or any pick list) and tap a 📌 number to follow a pick. I\'ll tell you the result and keep your win rate and flat-stake ROI here.', kb: Markup.inlineKeyboard([[Markup.button.callback('🔟 Open Best 10', 'best10')]]) };
+  const rows = (await q('SELECT * FROM followed WHERE user_id = $1 ORDER BY utc DESC LIMIT 12', [u.id])).rows;
+  let tx = '📌 <b>My record</b>\n━━━━━━━━━━━━━━\n';
+  tx += s.n ? `✅ <b>${s.w}/${s.n}</b> correct (${pct(s.w / s.n)}%) · ROI <b>${signed((Number(s.profit) / s.n) * 100)}%</b> <i>(1 unit flat)</i>\n` : 'No settled picks yet.\n';
+  if (s.pending) tx += `⏳ ${s.pending} pending\n`;
+  tx += '\n';
+  for (const f of rows) {
+    const icon = f.won == null ? '⏳' : f.won ? '✅' : '❌';
+    tx += `${icon} ${fmtDate(f.utc)} <b>${esc(f.home)} vs ${esc(f.away)}</b> — ${esc(f.label)}${f.odds ? ' @ ' + Number(f.odds).toFixed(2) : ''}\n`;
+  }
+  return { text: tx + '\n🏅 See how you rank: /leaders', kb: null };
+}
+const maskName = (n) => (n ? esc(String(n).slice(0, 1)) + '•••' : 'Player');
+async function renderLeaders(u) {
+  const rows = (await q(
+    `SELECT f.user_id, u.first_name, count(*)::int AS n, count(*) FILTER (WHERE f.won)::int AS w, COALESCE(sum(f.profit), 0) AS profit
+     FROM followed f JOIN users u ON u.id = f.user_id
+     WHERE f.won IS NOT NULL AND f.utc > $1 GROUP BY f.user_id, u.first_name HAVING count(*) >= $2
+     ORDER BY (count(*) FILTER (WHERE f.won))::float / count(*) DESC, count(*) DESC LIMIT 50`, [Date.now() - 30 * 864e5, LB_MIN_PICKS])).rows;
+  let tx = `🏅 <b>Leaderboard — last 30 days</b>\n<i>Followed picks only · minimum ${LB_MIN_PICKS} settled picks · names are hidden for privacy.</i>\n\n`;
+  if (!rows.length) return { text: tx + 'Nobody qualifies yet — follow picks with the 📌 buttons and be the first!', kb: null };
+  const medal = ['🥇', '🥈', '🥉'];
+  rows.slice(0, 10).forEach((r, i) => {
+    tx += `${medal[i] || (i + 1) + '.'} ${r.user_id === u.id ? '<b>You</b>' : maskName(r.first_name)} — ${r.w}/${r.n} (${pct(r.w / r.n)}%) · ROI ${signed((Number(r.profit) / r.n) * 100, 0)}%\n`;
+  });
+  const me = rows.findIndex((r) => r.user_id === u.id);
+  tx += me >= 10 ? `\n📍 Your rank: <b>#${me + 1}</b> of ${rows.length}` : me < 0 ? `\n📍 Settle ${LB_MIN_PICKS} followed picks to enter the board (/myrecord).` : '';
+  return { text: tx, kb: null };
+}
+
+// ----- Promo codes -----
+async function redeemCode(u, raw) {
+  const code = String(raw || '').trim().toUpperCase();
+  if (!/^[A-Z0-9_-]{3,24}$/.test(code)) return { ok: false, msg: '🎟 Send your code like this: <code>/redeem WELCOME7</code>' };
+  const c = (await q('SELECT * FROM promo_codes WHERE code = $1', [code])).rows[0];
+  if (!c || (c.expires_at && new Date(c.expires_at) < new Date())) return { ok: false, msg: '❌ That code is invalid or has expired.' };
+  if ((await q('SELECT 1 FROM promo_redemptions WHERE code = $1 AND user_id = $2', [code, u.id])).rows.length) return { ok: false, msg: 'ℹ️ You already used this code.' };
+  const upd = await q('UPDATE promo_codes SET uses = uses + 1 WHERE code = $1 AND uses < max_uses AND (expires_at IS NULL OR expires_at > now()) RETURNING days', [code]);
+  if (!upd.rows.length) return { ok: false, msg: '❌ This code has been fully redeemed.' };
+  const ins = await q('INSERT INTO promo_redemptions (code, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING code', [code, u.id]);
+  if (!ins.rows.length) { await q('UPDATE promo_codes SET uses = uses - 1 WHERE code = $1', [code]); return { ok: false, msg: 'ℹ️ You already used this code.' }; }
+  const days = upd.rows[0].days;
+  const nu = await grantDays(u.id, days);
+  return { ok: true, u: nu, msg: `🎉 <b>Code accepted!</b> +${days} day${days > 1 ? 's' : ''} of Premium — active until <b>${fmtUntil(nu.plan_until)}</b>.` };
+}
+
+// ----- Responsible play + self-exclusion -----
+const RG_TIPS = '• Only stake money you can afford to lose — never money for rent, bills or school fees.\n• Set a budget and a time limit before you start, and stick to it.\n• Never chase losses. Picks are estimates, not guarantees — any bet can lose.\n• Betting should be fun. If it stops being fun, take a break and talk to someone you trust.\n• 18+ only.';
+function responsibleView(u) {
+  const ex = u.excluded_until && new Date(u.excluded_until) > new Date();
+  let tx = '🛡 <b>Responsible play</b>\n━━━━━━━━━━━━━━\n' + RG_TIPS + '\n\n';
+  if (ex) return { text: tx + `⛔ Self-exclusion is active until <b>${fmtUntil(u.excluded_until)}</b>. Picks, tips and alerts are paused.`, kb: navKb() };
+  tx += '⏸ <b>Need a break?</b> Choose a self-exclusion period. While it runs, picks, tips and alerts are switched off — and it cannot be undone early.';
+  return { text: tx, kb: navKb([[Markup.button.callback('24 hours', 'se:1'), Markup.button.callback('7 days', 'se:7')], [Markup.button.callback('30 days', 'se:30'), Markup.button.callback('90 days', 'se:90')]]) };
+}
+
+// ----- Navigation: main menu + section hubs -----
+function mainText(u) {
+  const plan = isAdminId(u.id) ? '🛡 Admin' : hasPremium(u) ? `💎 Premium · until ${fmtUntil(u.plan_until)}` : '🆓 Free plan';
+  const today = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday: 'long', day: '2-digit', month: 'short' }).format(new Date());
+  return `⚽ <b>Football Predictions</b>\n━━━━━━━━━━━━━━\n👋 ${esc(u.first_name || 'there')} · ${plan}\n📅 ${today}\n\nChoose a section 👇`;
+}
+const mainKb = (u) => Markup.inlineKeyboard([
+  [Markup.button.callback('🔥 Daily Picks', 'hub:picks'), Markup.button.callback('⚽ Matches Today', 'today')],
+  [Markup.button.callback('📈 Markets', 'hub:markets'), Markup.button.callback('🎯 Accumulators', 'hub:acca')],
+  [Markup.button.callback('🔴 Live Scores', 'live'), Markup.button.callback('📊 Tables', 'tbl')],
+  [Markup.button.callback('👤 My Zone', 'hub:me'), Markup.button.callback('⚙️ Settings', 'st')],
+  [Markup.button.callback(hasPremium(u) ? '💎 My Premium' : '💎 Go Premium', 'up'), Markup.button.callback('🛡 Responsible', 'resp'), Markup.button.callback('❓ Help', 'help')],
+]);
+const LBTN = (u, label, data, prem = true) => Markup.button.callback((prem && !hasPremium(u) ? '🔒 ' : '') + label, data);
+function hubView(name, u) {
+  const back = [Markup.button.callback('⬅️ Menu', 'menu')];
+  const free = hasPremium(u) ? '' : '\n<i>🔒 = Premium. Tap one to preview it.</i>';
+  if (name === 'picks') {
+    const proof = proofLine();
+    return {
+      text: '🔥 <b>Daily Picks</b>\n━━━━━━━━━━━━━━\n🔟 <b>Best 10</b> — free ranked picks\n🏆 <b>Top 5</b> — the sharpest picks of the day\n💎 <b>Best 3</b> — under-the-radar picks\n🥇 <b>Best 1</b> — the single best pick\n🔟⭐ <b>Best 10 Pro</b> — top 10 with confidence tiers\n🌟 <b>Pick of the Week</b>' + (proof ? `\n\n${proof}` : '') + free,
+      kb: Markup.inlineKeyboard([
+        [LBTN(u, '🔟 Best 10 · Free', 'best10', false), LBTN(u, '🏆 Top 5', 'top5')],
+        [LBTN(u, '💎 Best 3', 'best3'), LBTN(u, '🥇 Best 1', 'best1')],
+        [LBTN(u, '🔟⭐ Best 10 Pro', 'best10pro'), LBTN(u, '🌟 Pick of the Week', 'potw')],
+        back,
+      ]),
+    };
+  }
+  if (name === 'markets') {
+    return {
+      text: '📈 <b>Markets</b>\n━━━━━━━━━━━━━━\n📈 <b>Value bets</b> — model beats the best bookie price\n⚽ <b>Goals</b> — over/under 2.5 and BTTS\n🛡 <b>Double chance</b> — safer 1X / X2 / DNB\n🎯 <b>Correct score</b> — likeliest scorelines' + free,
+      kb: Markup.inlineKeyboard([[LBTN(u, '📈 Value bets', 'value'), LBTN(u, '⚽ Goals', 'goals')], [LBTN(u, '🛡 Double chance', 'dc'), LBTN(u, '🎯 Correct score', 'scores')], back]),
+    };
+  }
+  if (name === 'acca') {
+    return {
+      text: '🎯 <b>Accumulators</b>\n━━━━━━━━━━━━━━\n🎯 <b>Acca builder</b> — safe / balanced / risky, 2–6 legs\n🛡 <b>Safe slip</b> — safest combo reaching ' + SAFE_TARGET_ODDS.toFixed(1) + ' odds\n🏖 <b>Weekend special</b> — 4-leg slip on Fri–Sun' + free,
+      kb: Markup.inlineKeyboard([[LBTN(u, '🎯 Acca builder', 'acca:balanced:3'), LBTN(u, '🛡 Safe slip', 'safe')], [LBTN(u, '🏖 Weekend special', 'weekend')], back]),
+    };
+  }
+  return {
+    text: '👤 <b>My Zone</b>\n━━━━━━━━━━━━━━\n📌 <b>My record</b> — your followed picks and win rate\n🏅 <b>Leaderboard</b> — top followers this month\n⭐ <b>Watchlist</b> — kickoff alerts and results\n🎁 <b>Refer &amp; earn</b> — free Premium days\n🎟 <b>Redeem code</b> — promo codes\n📊 <b>Track record</b> — how the model is doing',
+    kb: Markup.inlineKeyboard([
+      [Markup.button.callback('📌 My record', 'myrec'), Markup.button.callback('🏅 Leaderboard', 'leaders')],
+      [LBTN(u, '⭐ Watchlist', 'wl'), Markup.button.callback('🎁 Refer & earn', 'refer')],
+      [Markup.button.callback('🎟 Redeem code', 'redeem'), Markup.button.callback('👤 Account', 'acct')],
+      [Markup.button.callback('📊 Track record', 'trk'), Markup.button.callback('⚙️ Settings', 'st')],
+      back,
+    ]),
+  };
+}
+
+// ----- Background jobs added by the feature pack -----
+// 1) free daily tips for non-premium users (opt-out any time)
+let teaserBackoffUntil = 0;
+async function renderTeaserPush(u) {
+  const list = applyPrefs((await computeBest10()).filter(isUpcoming), u).slice(0, 3);
+  if (!list.length) return { empty: true };
+  let tx = '☀️ <b>Today\'s free tips</b>\n━━━━━━━━━━━━━━\n';
+  list.forEach(({ m, sc }, i) => {
+    const p = sc.pick;
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 <b>${esc(p.label)}</b> @ ${p.odds.toFixed(2)} · ${dotOf(p.p)} ${pct(p.p)}%\n`;
+  });
+  tx += '\n🔒 <i>Today\'s Top 5, Best 3 and Best 1 are ready for Premium members.</i>';
+  const proof = proofLine();
+  if (proof) tx += '\n' + proof;
+  tx += '\n\n⚠️ <i>18+ · bet responsibly. Estimates only, not guaranteed.</i>';
+  return { empty: false, text: tx, kb: Markup.inlineKeyboard([[Markup.button.callback('🔟 Full Best 10', 'best10'), Markup.button.callback('💎 Unlock Premium', 'up')], [Markup.button.callback('🔕 Stop daily tips', 'tsr:off')]]) };
+}
+async function teaserTick() {
+  if (Date.now() < teaserBackoffUntil) return;
+  const now = new Date();
+  const { rows } = await q(
+    `SELECT * FROM users WHERE teaser_daily AND NOT banned AND NOT blocked AND (plan_until IS NULL OR plan_until <= now())
+     AND (excluded_until IS NULL OR excluded_until <= now()) AND NOT (id = ANY($1::bigint[]))`, [ADMIN_IDS]);
+  const due = rows.filter((u) => { const h = hourTz(now, u.tz); return u.last_teaser !== localDateTz(now, u.tz) && h >= TEASER_HOUR && h < TEASER_HOUR + 4; });
+  if (!due.length) return;
+  if (!(await getMatchesToday()).length) { teaserBackoffUntil = Date.now() + 30 * 60e3; return; }
+  for (const u of due) {
+    const r = await renderTeaserPush(u);
+    if (r.empty) { teaserBackoffUntil = Date.now() + 20 * 60e3; return; } // odds not out yet — retry later
+    const claim = await q('UPDATE users SET last_teaser = $2 WHERE id = $1 AND last_teaser IS DISTINCT FROM $2 RETURNING id', [u.id, localDateTz(now, u.tz)]);
+    if (!claim.rows.length) continue;
+    await sendTo(u.id, r.text, { reply_markup: r.kb.reply_markup });
+    await sleep(60);
+  }
+}
+
+// 2) price-move alerts: a published pick's odds moved by STALE_DRIFT or more (sent to people who follow it + admins)
+async function staleTick() {
+  const now = Date.now();
+  const cand = predLog.filter((r) => r.tags && r.tags.length && !r.res && !r.staleAlerted && r.pubOdds && r.pubPick && r.utc > now && r.utc < now + 8 * 3600e3);
+  if (!cand.length) return;
+  const matches = await getMatchesToday().catch(() => []);
+  for (const r of cand) {
+    const m = matches.find((x) => x.id === r.id);
+    if (!m || !m.odds) continue;
+    const pub = r.pubOdds[r.pubPick], cur = m.odds.odds[r.pubPick];
+    if (!pub || !cur) continue;
+    const drift = (cur - pub) / pub;
+    if (Math.abs(drift) < STALE_DRIFT) continue;
+    r.staleAlerted = true; predDirty.add(r.id); savePredLog();
+    const txt = `⚠️ <b>Price move</b> — ${esc(r.home)} vs ${esc(r.away)}\nOur pick (<b>${esc(pickName(r.home, r.away, r.pubPick))}</b>) was <b>${pub.toFixed(2)}</b> when published, now <b>${cur.toFixed(2)}</b> (${signed(drift * 100, 0)}%).\n` +
+      (drift < 0 ? 'The market has shortened — the value may be gone. Check your bookie before betting.' : 'The price has drifted out — the market is less sure (team news?). Re-check before betting.');
+    const ids = new Set(ADMIN_IDS);
+    (await q('SELECT user_id FROM followed WHERE match_id = $1 AND won IS NULL', [r.id])).rows.forEach((x) => ids.add(x.user_id));
+    for (const id of ids) { await sendTo(id, txt); await sleep(40); }
+  }
+}
+
+// 3) settle followed picks + personal result messages
+async function followTick() {
+  const { rows } = await q('SELECT * FROM followed WHERE won IS NULL AND utc < $1 AND utc > $2', [Date.now() - 2 * 3600e3, Date.now() - 5 * 864e5]);
+  for (const f of rows) {
+    const r = predById.get(f.match_id);
+    if (!r || !r.res) continue;
+    const won = f.pick === r.res;
+    const profit = won ? (f.odds ? Number(f.odds) - 1 : 0) : -1;
+    const upd = await q('UPDATE followed SET res = $3, won = $4, profit = $5 WHERE user_id = $1 AND match_id = $2 AND won IS NULL RETURNING user_id', [f.user_id, f.match_id, r.res, won, profit]);
+    if (!upd.rows.length) continue;
+    await sendTo(f.user_id, `${won ? '✅' : '❌'} <b>Your pick ${won ? 'won' : 'lost'}</b>\n${esc(f.home)} vs ${esc(f.away)}${r.score ? ' (' + esc(r.score) + ')' : ''}\nYour pick: ${esc(f.label)}${f.odds ? ' @ ' + Number(f.odds).toFixed(2) : ''}\n📌 Your record: /myrecord`);
+    await sleep(40);
+  }
+}
+
 // ---------- Background jobs ----------
 let pushBackoffUntil = 0;
 async function pushTick() {
   if (Date.now() < pushBackoffUntil) return;
   const now = new Date();
   const { rows } = await q(
-    `SELECT * FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (plan_until > now() OR id = ANY($1::bigint[]))`, [ADMIN_IDS]);
+    `SELECT * FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]))`, [ADMIN_IDS]);
   const due = rows.filter((u) => {
     const h = hourTz(now, u.tz);
     return u.last_push !== localDateTz(now, u.tz) && h >= u.push_hour && h < u.push_hour + 4;
@@ -2366,8 +2782,8 @@ async function pushTick() {
     const claim = await q(`UPDATE users SET last_push = $2 WHERE id = $1 AND last_push IS DISTINCT FROM $2 RETURNING id`, [u.id, localDateTz(now, u.tz)]);
     if (!claim.rows.length) continue;
     await sendTo(u.id, `${t(u, 'daily_head')}`);
-    if (!a.empty) await sendTo(u.id, a.text);
-    if (!b.empty) await sendTo(u.id, b.text);
+    if (!a.empty) await sendTo(u.id, a.text, a.kb ? { reply_markup: a.kb.reply_markup } : {});
+    if (!b.empty) await sendTo(u.id, b.text, b.kb ? { reply_markup: b.kb.reply_markup } : {});
     await sleep(60);
   }
 }
@@ -2382,15 +2798,26 @@ async function kickoffTick() {
   }
 }
 async function expiryTick() {
+  // 24h before the end: one-tap renew buttons
   const { rows } = await q(`SELECT * FROM users WHERE plan_until BETWEEN now() AND now() + interval '24 hours' AND NOT warned_exp AND NOT blocked`);
   for (const u of rows) {
     await q('UPDATE users SET warned_exp = true WHERE id = $1', [u.id]);
-    await sendTo(u.id, t(u, 'exp_warn', fmtUntil(u.plan_until)), { reply_markup: upgradeKb(u).reply_markup });
+    await sendTo(u.id, t(u, 'exp_warn', fmtUntil(u.plan_until)) + '\n\n👇 Renew in one tap:', { reply_markup: renewKb().reply_markup });
+    await sleep(40);
+  }
+  // win-back: sent once, within 2 days after Premium ended
+  const gone = await q(`SELECT * FROM users WHERE plan_until BETWEEN now() - interval '2 days' AND now() AND NOT expired_notified AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now())`);
+  for (const u of gone.rows) {
+    await q('UPDATE users SET expired_notified = true WHERE id = $1', [u.id]);
+    const proof = proofLine();
+    await sendTo(u.id, '💤 <b>Your Premium has ended.</b>\nTomorrow\'s Top 5, Best 3 and Best 1 will be locked.' + (proof ? '\n\n' + proof : '') + '\n\n🎟 Come back with a <b>Day pass</b>, or renew for a week or a month:', { reply_markup: renewKb().reply_markup });
+    await sleep(40);
   }
 }
 const sign1x2 = { H: '1', D: 'X', A: '2' };
 async function settleTick() {
   const changed = await resolveLog();
+  await followTick().catch((e) => console.log('followTick failed:', e.message));
   // 1) watched matches: individual result messages
   const { rows } = await q(`SELECT w.*, u.lang FROM watch w JOIN users u ON u.id = w.user_id WHERE NOT w.res_sent AND w.utc < $1`, [Date.now() - 2 * 3600e3]);
   for (const w of rows) {
@@ -2418,7 +2845,7 @@ async function settleTick() {
     tx += `${k === r.res ? '✅' : '❌'} ${esc(r.home)} vs ${esc(r.away)} — pick ${sign1x2[k]}, result ${sign1x2[r.res]}${r.score ? ' (' + r.score + ')' : ''}\n`;
   }
   tx += `\n<b>${won}/${fresh.length}</b> correct. Full record: /stats · /history`;
-  const subs = (await q(`SELECT id FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (plan_until > now() OR id = ANY($1::bigint[]))`, [ADMIN_IDS])).rows;
+  const subs = (await q(`SELECT id FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]))`, [ADMIN_IDS])).rows;
   for (const s of subs) { await sendTo(s.id, tx); await sleep(40); }
 }
 let tickN = 0, ticking = false;
@@ -2429,8 +2856,10 @@ async function schedulerTick() {
     tickN++;
     await kickoffTick();
     await pushTick();
+    await teaserTick();
     if (tickN % 5 === 0) await recheckPendingPaystack();
     if (tickN % 10 === 0) await expiryTick();
+    if (tickN % 15 === 0) await staleTick();
     if (tickN % 30 === 0) await settleTick();
   } catch (e) { console.log('Scheduler error:', e.message); }
   ticking = false;
@@ -2468,10 +2897,25 @@ bot.use(async (ctx, next) => {
   }
   ctx.isAdmin = isAdminId(ctx.from.id);
   if (ctx.u.banned && !ctx.isAdmin) return;
+  if (ctx.u.excluded_until && new Date(ctx.u.excluded_until) > new Date() && !ctx.isAdmin) { // self-exclusion: only /responsible, /account, /help and payments stay reachable
+    const txt = (ctx.message && ctx.message.text) || '';
+    const cb = (ctx.callbackQuery && ctx.callbackQuery.data) || '';
+    const ok = /^\/(responsible|selfexclude|account|help)\b/i.test(txt) || ['resp', 'acct', 'help'].includes(cb) || (ctx.message && ctx.message.successful_payment) || ctx.preCheckoutQuery;
+    if (!ok) {
+      const note = `🛡 Self-exclusion is active until ${fmtUntil(ctx.u.excluded_until)}. Picks, tips and alerts are paused. /responsible has support tips.`;
+      if (ctx.callbackQuery) return ctx.answerCbQuery(note, { show_alert: true }).catch(() => {});
+      if (ctx.inlineQuery) return ctx.answerInlineQuery([], { cache_time: 60, is_personal: true }).catch(() => {});
+      if (ctx.message) return ctx.reply(note);
+      return;
+    }
+  }
   ctx.premium = hasPremium(ctx.u);
   return next();
 });
-const paywall = (ctx, text) => reply(ctx, text || t(ctx.u, 'premium_only'), upgradeKb(ctx.u));
+const paywall = (ctx, text) => {
+  const proof = proofLine();
+  return reply(ctx, (text || t(ctx.u, 'premium_only')) + (proof ? '\n\n' + proof : ''), quickBuyKb());
+};
 const needPremium = (fn) => (ctx) => (ctx.premium ? fn(ctx) : paywall(ctx));
 const adminOnly = (fn) => (ctx) => (ctx.isAdmin ? fn(ctx) : undefined);
 
@@ -2489,23 +2933,14 @@ async function applyReferral(ctx, refId) {
 }
 
 // ----- basics -----
-const mainKb = (u) => Markup.inlineKeyboard([
-  [Markup.button.callback('⚽ Today', 'today'), Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5')],
-  [Markup.button.callback('💎 Best 3', 'best3'), Markup.button.callback('🥇 Best 1', 'best1'), Markup.button.callback('📈 Value', 'value')],
-  [Markup.button.callback('🎯 Acca', 'acca:balanced:3'), Markup.button.callback('🔴 Live', 'live')],
-  [Markup.button.callback('📊 Tables', 'tbl'), Markup.button.callback('⭐ Watchlist', 'wl'), Markup.button.callback('⚙️ Settings', 'st')],
-  [Markup.button.callback('💳 Premium', 'up'), Markup.button.callback('👤 Account', 'acct'), Markup.button.callback('❓ Help', 'help')],
-]);
 // ----- GUI helpers: Menu button on every screen, bottom keyboard -----
 const MENU_BTN = Markup.button.callback('🏠 Menu', 'menu');
 const withNav = (kb, rows = []) => Markup.inlineKeyboard([...((kb && kb.reply_markup && kb.reply_markup.inline_keyboard) || []), ...rows, [MENU_BTN]]);
 const navKb = (rows = []) => withNav(null, rows);
 const replyMenu = Markup.keyboard([
-  ['⚽ Today', '🔟 Best 10', '🏆 Top 5'],
-  ['💎 Best 3', '📈 Value', '🎯 Acca'],
-  ['🔴 Live'],
-  ['📊 Tables', '⭐ Watchlist', '⚙️ Settings'],
-  ['💳 Premium', '👤 Account', '❓ Help'],
+  ['🔥 Picks', '⚽ Today', '🔴 Live'],
+  ['📈 Markets', '🎯 Accas', '👤 My Zone'],
+  ['💎 Premium', '🛡 Responsible', '🏠 Menu'],
 ]).resize();
 if (replyMenu.reply_markup) { replyMenu.reply_markup.is_persistent = true; replyMenu.reply_markup.input_field_placeholder = 'Pick an option…'; }
 const showToday = async (ctx) => {
@@ -2514,6 +2949,13 @@ const showToday = async (ctx) => {
   catch (e) { console.error(e); await ctx.reply('⚠️ Could not load matches right now. Please try again in a minute.'); }
 };
 const MENU_ACTIONS = {
+  '🔥 Picks': (ctx) => showHub('picks')(ctx),
+  '📈 Markets': (ctx) => showHub('markets')(ctx),
+  '🎯 Accas': (ctx) => showHub('acca')(ctx),
+  '👤 My Zone': (ctx) => showHub('me')(ctx),
+  '💎 Premium': (ctx) => showPremium(ctx),
+  '🛡 Responsible': (ctx) => showResponsible(ctx),
+  '🏠 Menu': (ctx) => reply(ctx, mainText(ctx.u), mainKb(ctx.u)),
   '⚽ Today': (ctx) => showToday(ctx),
   '🔟 Best 10': (ctx) => picksHandler('best10')(ctx),
   '🏆 Top 5': (ctx) => picksHandler('top5')(ctx),
@@ -2529,14 +2971,18 @@ const MENU_ACTIONS = {
   '❓ Help': (ctx) => helpH(ctx),
 };
 bot.hears(Object.keys(MENU_ACTIONS), (ctx) => { Promise.resolve(MENU_ACTIONS[ctx.message.text](ctx)).catch((e) => console.error(e)); });
-bot.command('menu', (ctx) => reply(ctx, '🏠 <b>Main menu</b>\nWhat would you like to see?', mainKb(ctx.u)));
-bot.action('menu', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); await editOrReply(ctx, '🏠 <b>Main menu</b>\nWhat would you like to see?', mainKb(ctx.u)); });
+bot.command('menu', (ctx) => reply(ctx, mainText(ctx.u), mainKb(ctx.u)));
+bot.action('menu', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); await editOrReply(ctx, mainText(ctx.u), mainKb(ctx.u)); });
 for (const [id, label] of [['tbl', '📊 Tables'], ['wl', '⭐ Watchlist'], ['st', '⚙️ Settings'], ['acct', '👤 Account'], ['help', '❓ Help']]) {
   bot.action(id, async (ctx) => { await ctx.answerCbQuery().catch(() => {}); Promise.resolve(MENU_ACTIONS[label](ctx)).catch((e) => console.error(e)); });
 }
 bot.start(async (ctx) => {
   const payload = ctx.startPayload || '';
   if (ctx.isNew && payload.startsWith('ref_')) await applyReferral(ctx, Number(payload.slice(4))).catch((e) => console.log('Referral failed:', e.message));
+  if (payload.startsWith('promo_')) {
+    const pr = await redeemCode(ctx.u, payload.slice(6)).catch(() => null);
+    if (pr) { await reply(ctx, pr.msg); if (pr.ok && pr.u) { ctx.u = pr.u; ctx.premium = hasPremium(pr.u); } }
+  }
   await reply(ctx, t(ctx.u, 'start', ctx.from.first_name) + '\n\n' + t(ctx.u, 'disc'), mainKb(ctx.u));
   await ctx.reply('👇 Your quick menu is now at the bottom of the chat.', replyMenu);
 });
@@ -2550,6 +2996,7 @@ const helpH = (ctx) => {
       `• AI: an online AI model reads the stats and gives its own estimate, kept close to the market (${pct(W_AI / tot)}%)\n\n` +
       'Top 5 = matches where the blended probability of one outcome is highest.\n' +
       'Best 3 = same blend, but only matches where neither team is a big-name club or in the top ' + TOP_RANK_EXCLUDE + ' of its table.\n' +
+      'Best 10 (free) = the next-ranked picks after the Premium Top 5. Best 10 Pro = the 10 top-ranked picks with confidence tiers. Safe slip = the most likely combination reaching ' + SAFE_TARGET_ODDS.toFixed(1) + ' total odds.\n' +
       'Value = model probability beats the best bookmaker price by a margin. Acca = picks combined from today\'s best matches.\n\n' +
       CMD_LIST + '\n\n' + t(ctx.u, 'disc'), navKb());
 };
@@ -2601,18 +3048,19 @@ bot.action(/^m:(\d+):(\d+)$/, async (ctx) => {
   } catch (e) { console.error(e); await ctx.reply('⚠️ Could not analyse that match right now.'); }
 });
 
-// top 5 / best 3 (free users see FREE_PICKS)
+// Best 10 is free; Top 5 / Best 3 / Best 1 are Premium (free users get a teaser: the matches, not the picks)
 const picksHandler = (kind) => async (ctx) => {
-  // Best 10 is free; Top 5 / Best 3 / Best 1 are Premium-only
-  if (kind !== 'best10' && !ctx.premium) return paywall(ctx, `🔒 <b>${{ top5: 'Top 5', best3: 'Best 3', best1: 'Best 1' }[kind]} is a Premium feature.</b>\nFree users get the 🔟 Best 10 picks (/best10). Upgrade to unlock the top-ranked picks.`);
   const wait = await ctx.reply(t(ctx.u, kind === 'top5' || kind === 'best10' ? 'wait_top5' : 'wait_best3'));
   try {
     await ctx.sendChatAction('typing');
-    const r = kind === 'best10' ? await renderBest10(ctx.u) : await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: true, only1: kind === 'best1' });
+    const locked = kind !== 'best10' && !ctx.premium;
+    const r = locked ? await renderTeaser(ctx.u, kind)
+      : kind === 'best10' ? await renderBest10(ctx.u)
+      : await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: true, only1: kind === 'best1' });
     await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
-    const B = { best10: '🔟 Best 10', top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1' };
-    const others = Object.keys(B).filter((x) => x !== kind).map((x) => Markup.button.callback(B[x], x));
-    await replyLong(ctx, r.text, withNav(r.kb, [others, [Markup.button.callback('⚽ Today', 'today')]]));
+    const SIB = { best10: ['🔟 Best 10', false], top5: ['🏆 Top 5', true], best3: ['💎 Best 3', true], best1: ['🥇 Best 1', true] };
+    const others = Object.keys(SIB).filter((x) => x !== kind).map((x) => Markup.button.callback((SIB[x][1] && !ctx.premium ? '🔒 ' : '') + SIB[x][0], x));
+    await replyLong(ctx, r.text, withNav(r.kb, [others, [Markup.button.callback('🔥 Picks hub', 'hub:picks'), Markup.button.callback('⚽ Today', 'today')]]));
   } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
 };
 bot.command('top5', detach(picksHandler('top5')));
@@ -2804,22 +3252,16 @@ bot.action(/^uw:(\d+)$/, async (ctx) => {
 
 // ----- account, referral, premium + payments -----
 bot.command('account', async (ctx) => reply(ctx, await renderAccount(ctx)));
-bot.command('refer', async (ctx) => {
-  const me = ctx.botInfo || bot.botInfo || {};
-  const n = (await q('SELECT count(*)::int AS n FROM users WHERE referred_by = $1', [ctx.u.id])).rows[0].n;
-  const link = `https://t.me/${me.username}?start=ref_${ctx.u.id}`;
-  await reply(ctx, `🎁 <b>Invite friends, earn Premium</b>\nYou get <b>+${REF_BONUS_DAYS} days</b> for each friend who joins (up to ${REF_MAX}); they get <b>${REF_NEW_DAYS} free day${REF_NEW_DAYS > 1 ? 's' : ''}</b>.\n\n🔗 Your link:\n${link}\n\n👥 Joined so far: <b>${n}</b>`);
-});
 const showPremium = (ctx) => { const v = premiumView(ctx.u); return reply(ctx, v.text, v.kb); };
 bot.command('premium', showPremium);
 bot.command('upgrade', showPremium);
 bot.action('up', async (ctx) => { await ctx.answerCbQuery(); return showPremium(ctx); });
 
-bot.action(/^buy:xtr:(week|month)$/, async (ctx) => {
+bot.action(/^buy:xtr:(day|week|month)$/, async (ctx) => {
   await ctx.answerCbQuery();
   try { await sendStarsInvoice(ctx, ctx.match[1]); } catch (e) { console.error(e); await ctx.reply('⚠️ Could not open the Stars invoice. Please try again.'); }
 });
-bot.action(/^buy:ps:(week|month)$/, async (ctx) => {
+bot.action(/^buy:ps:(day|week|month)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (!PAYSTACK_KEY) return;
   try {
@@ -2871,7 +3313,7 @@ bot.on('inline_query', async (ctx) => {
 // ----- admin tools (admins have every feature, no limits) -----
 const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
-  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/forceupdate – clear caches\n/userinfo &lt;id&gt;';
+  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/forceupdate – clear caches\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
 bot.command('admin', adminOnly((ctx) => reply(ctx, ADMIN_HELP)));
 bot.command('users', adminOnly(async (ctx) => {
   const s = (await q(`SELECT count(*)::int total, count(*) FILTER (WHERE plan_until > now())::int premium, count(*) FILTER (WHERE sub_daily)::int subs,
@@ -2921,7 +3363,7 @@ bot.command('userinfo', adminOnly(async (ctx) => {
 const broadcast = (premiumOnly) => adminOnly(async (ctx) => {
   const text = ctx.message.text.replace(/^\/\S+\s*/, '');
   if (!text) return reply(ctx, 'Usage: /broadcast &lt;message&gt; (HTML allowed)');
-  const ids = (await q(`SELECT id FROM users WHERE NOT banned AND NOT blocked ${premiumOnly ? 'AND plan_until > now()' : ''}`)).rows.map((r) => r.id);
+  const ids = (await q(`SELECT id FROM users WHERE NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) ${premiumOnly ? 'AND plan_until > now()' : ''}`)).rows.map((r) => r.id);
   await reply(ctx, `📣 Sending to ${ids.length} users…`);
   (async () => {
     let ok = 0;
@@ -2938,34 +3380,219 @@ bot.command('forceupdate', adminOnly(async (ctx) => {
   await reply(ctx, `♻️ Cleared ${n} cached entries. The next /today or /top5 re-downloads everything (uses API credits).`);
 }));
 
+// =====================================================================
+//  FEATURE PACK — handlers (hubs, new Premium tools, follow/record, promo, safety, admin dashboard)
+// =====================================================================
+const answered = (h) => async (ctx) => { await ctx.answerCbQuery().catch(() => {}); return h(ctx); };
+const sendR = (fn) => async (ctx) => {
+  try { const r = await fn(ctx); await replyLong(ctx, r.text, r.kb ? withNav(r.kb) : navKb()); }
+  catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
+};
+
+// ----- section hubs -----
+const showHub = (name) => async (ctx) => { const v = hubView(name, ctx.u); return reply(ctx, v.text, v.kb); };
+bot.command('picks', showHub('picks'));
+bot.command('markets', showHub('markets'));
+bot.command('accas', showHub('acca'));
+bot.command('myzone', showHub('me'));
+bot.action(/^hub:(picks|markets|acca|me)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const v = hubView(ctx.match[1], ctx.u);
+  await editOrReply(ctx, v.text, v.kb);
+});
+
+// ----- new Premium tools (+ button handlers for the existing goals / dc) -----
+const PREM_TOOLS = {
+  best10pro: ['🔟⭐ Best 10 Pro', (c) => renderBest10Pro(c.u)],
+  safe: ['🛡 Safe slip', (c) => renderSafe(c.u)],
+  scores: ['🎯 Correct score', (c) => renderScores(c.u)],
+  potw: ['🌟 Pick of the Week', (c) => renderPotw(c.u)],
+  weekend: ['🏖 Weekend special', (c) => renderWeekend(c.u)],
+  goals: ['⚽ Goals markets', (c) => renderGoals(c.u)],
+  dc: ['🛡 Double chance', (c) => renderDC(c.u)],
+};
+for (const [name, [label, fn]] of Object.entries(PREM_TOOLS)) {
+  const h = toolHandler(fn);
+  if (!['goals', 'dc'].includes(name)) bot.command(name, needPremium(detach(h)));
+  bot.action(name, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!ctx.premium) return paywall(ctx, `🔒 <b>${label}</b> is a Premium feature.`);
+    h(ctx).catch(console.error);
+  });
+}
+
+// ----- follow a pick / personal record / leaderboard -----
+bot.action(/^fp:(\d+)$/, async (ctx) => {
+  const id = Number(ctx.match[1]);
+  const r = predById.get(id);
+  if (!r || !r.final || r.utc <= Date.now()) return ctx.answerCbQuery('This match has started — it can no longer be followed.', { show_alert: true });
+  const today = (await q(`SELECT count(*)::int AS n FROM followed WHERE user_id = $1 AND created_at > now() - interval '1 day'`, [ctx.u.id])).rows[0].n;
+  if (today >= MAX_FOLLOW_DAY) return ctx.answerCbQuery(`You can follow up to ${MAX_FOLLOW_DAY} picks a day.`, { show_alert: true });
+  const k = r.pubPick || argmax(r.final);
+  const odds = (r.pubOdds || r.odds || {})[k] || null;
+  const ins = await q(
+    `INSERT INTO followed (user_id, match_id, home, away, utc, pick, label, odds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING match_id`,
+    [ctx.u.id, id, r.home, r.away, r.utc, k, pickName(r.home, r.away, k), odds]);
+  return ctx.answerCbQuery(ins.rows.length ? '📌 Following — I\'ll message you the result.' : 'You already follow this pick.', { show_alert: !ins.rows.length });
+});
+bot.command('myrecord', sendR((c) => renderMyRecord(c.u)));
+bot.action('myrec', answered(sendR((c) => renderMyRecord(c.u))));
+bot.command('leaders', sendR((c) => renderLeaders(c.u)));
+bot.action('leaders', answered(sendR((c) => renderLeaders(c.u))));
+bot.action('trk', answered(async (ctx) => {
+  await ctx.sendChatAction('typing').catch(() => {});
+  try { await replyLong(ctx, await renderStats(), navKb([[Markup.button.callback('📜 Recent picks', 'hist')]])); }
+  catch (e) { console.error(e); await ctx.reply('⚠️ Could not compute stats right now.'); }
+}));
+bot.action('hist', answered((ctx) => reply(ctx, renderHistory(), navKb())));
+
+// ----- referral screen (invite + paying-friend bonuses) -----
+async function sendRefer(ctx) {
+  const me = ctx.botInfo || bot.botInfo || {};
+  const n = (await q('SELECT count(*)::int AS n FROM users WHERE referred_by = $1', [ctx.u.id])).rows[0].n;
+  const paying = (await q(`SELECT count(DISTINCT p.user_id)::int AS n FROM payments p JOIN users x ON x.id = p.user_id WHERE x.referred_by = $1 AND p.status = 'success'`, [ctx.u.id])).rows[0].n;
+  const link = `https://t.me/${me.username}?start=ref_${ctx.u.id}`;
+  const next = REF_MILESTONE_N > 0 ? REF_MILESTONE_N - (paying % REF_MILESTONE_N) : 0;
+  const tx = '🎁 <b>Invite friends, earn Premium</b>\n━━━━━━━━━━━━━━\n' +
+    `• A friend joins: you get <b>+${REF_BONUS_DAYS} days</b> (up to ${REF_MAX}), they get <b>${REF_NEW_DAYS} free day${REF_NEW_DAYS > 1 ? 's' : ''}</b>\n` +
+    `• A friend pays for the first time: you get <b>+${REF_PAID_DAYS} days</b>\n` +
+    (REF_MILESTONE_N > 0 ? `• Every <b>${REF_MILESTONE_N} paying friends</b>: bonus <b>+${REF_MILESTONE_DAYS} days</b> 🏅\n` : '') +
+    `\n🔗 Your link:\n${link}\n\n👥 Joined: <b>${n}</b> · 💎 Paying: <b>${paying}</b>` + (next ? ` · next milestone in <b>${next}</b>` : '');
+  await reply(ctx, tx, Markup.inlineKeyboard([[Markup.button.url('📤 Share with friends', `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Daily football picks with odds & AI ⚽')}`)], [MENU_BTN]]));
+}
+bot.command('refer', sendRefer);
+bot.action('refer', answered(sendRefer));
+
+// ----- promo codes -----
+bot.command('redeem', async (ctx) => {
+  const r = await redeemCode(ctx.u, argText(ctx));
+  await reply(ctx, r.msg, r.ok ? mainKb(r.u || ctx.u) : undefined);
+});
+bot.action('redeem', answered((ctx) => reply(ctx, '🎟 <b>Redeem a promo code</b>\nSend it like this: <code>/redeem YOURCODE</code>', navKb())));
+
+// ----- responsible play, self-exclusion, free-tips toggle -----
+const showResponsible = async (ctx) => { const v = responsibleView(ctx.u); return reply(ctx, v.text, v.kb); };
+bot.command('responsible', showResponsible);
+bot.command('selfexclude', showResponsible);
+bot.action('resp', answered(async (ctx) => { const v = responsibleView(ctx.u); await editOrReply(ctx, v.text, v.kb); }));
+bot.action(/^se:(1|7|30|90)$/, answered(async (ctx) => {
+  const d = Number(ctx.match[1]);
+  await editOrReply(ctx, `⚠️ <b>Confirm self-exclusion</b>\nYou will be locked out of picks, tips and alerts for <b>${d} day${d > 1 ? 's' : ''}</b>. This cannot be undone early.`,
+    Markup.inlineKeyboard([[Markup.button.callback(`✅ Yes, pause me for ${d} day${d > 1 ? 's' : ''}`, `sec:${d}`)], [Markup.button.callback('↩️ Cancel', 'resp')]]));
+}));
+bot.action(/^sec:(1|7|30|90)$/, answered(async (ctx) => {
+  const d = Number(ctx.match[1]);
+  const { rows } = await q('UPDATE users SET excluded_until = now() + make_interval(days => $2::int), sub_daily = false, teaser_daily = false WHERE id = $1 RETURNING *', [ctx.u.id, d]);
+  await editOrReply(ctx, `🛡 <b>Self-exclusion started</b> — until <b>${fmtUntil(rows[0].excluded_until)}</b>.\nTake care of yourself. Picks, tips and alerts are paused; /responsible stays available.`);
+}));
+bot.action(/^tsr:(on|off|toggle)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const mode = ctx.match[1];
+  const on = mode === 'toggle' ? !ctx.u.teaser_daily : mode === 'on';
+  ctx.u = (await updUser(ctx.u.id, { teaser_daily: on })) || ctx.u;
+  if (mode === 'toggle') { const v = settingsView(ctx.u, ctx.premium); return editOrReply(ctx, v.text, v.kb); }
+  return ctx.reply(on ? '📬 Free daily tips are back ON.' : '🔕 Free daily tips are OFF. You can turn them back on in ⚙️ Settings.');
+});
+
+// ----- admin: dashboard, promo codes, lift an exclusion -----
+bot.command(['dashboard', 'dash'], adminOnly(async (ctx) => {
+  const sum = async (iv) => (await q(`SELECT currency, sum(amount) AS total, count(*)::int AS n FROM payments WHERE status = 'success' AND created_at > now() - interval '${iv}' GROUP BY currency`)).rows;
+  const f = (rows) => rows.map((r) => (r.currency === 'XTR' ? `${money(r.total)} ⭐` : `₦${money(r.total)}`)).join(' + ') || '0';
+  const cnt = (rows) => rows.reduce((a, r) => a + r.n, 0);
+  const [d1, d7, d30] = [await sum('1 day'), await sum('7 days'), await sum('30 days')];
+  const u = (await q(`SELECT count(*)::int total,
+    count(*) FILTER (WHERE joined_at > now() - interval '1 day')::int new1, count(*) FILTER (WHERE joined_at > now() - interval '7 days')::int new7,
+    count(*) FILTER (WHERE joined_at > now() - interval '30 days')::int new30, count(*) FILTER (WHERE last_seen > now() - interval '1 day')::int act1,
+    count(*) FILTER (WHERE last_seen > now() - interval '7 days')::int act7, count(*) FILTER (WHERE plan_until > now())::int premium,
+    count(*) FILTER (WHERE plan_until > now() AND plan_until < now() + interval '3 days')::int expiring,
+    count(*) FILTER (WHERE excluded_until > now())::int excluded, count(*) FILTER (WHERE teaser_daily AND NOT blocked AND NOT banned)::int tips,
+    count(*) FILTER (WHERE blocked)::int blocked FROM users`)).rows[0];
+  const pay = (await q(`SELECT count(DISTINCT user_id)::int AS payers, count(*) FILTER (WHERE rn > 1)::int AS renewals
+    FROM (SELECT user_id, row_number() OVER (PARTITION BY user_id ORDER BY created_at) rn FROM payments WHERE status = 'success') x`)).rows[0];
+  const lapsed = (await q(`SELECT count(*)::int AS n FROM users WHERE plan_until BETWEEN now() - interval '30 days' AND now()`)).rows[0].n;
+  const mix = (await q(`SELECT plan, count(*)::int AS n FROM payments WHERE status = 'success' AND created_at > now() - interval '30 days' GROUP BY plan ORDER BY n DESC`)).rows;
+  const promo = (await q(`SELECT (SELECT count(*)::int FROM promo_redemptions WHERE redeemed_at > now() - interval '30 days') AS red30,
+    (SELECT count(*)::int FROM promo_codes WHERE uses < max_uses AND (expires_at IS NULL OR expires_at > now())) AS active`)).rows[0];
+  const fol = (await q(`SELECT count(*) FILTER (WHERE created_at > now() - interval '1 day')::int AS d1, count(DISTINCT user_id)::int AS users FROM followed`)).rows[0];
+  const conv = u.total ? (pay.payers / u.total) * 100 : 0;
+  const churn = lapsed + u.premium ? (lapsed / (lapsed + u.premium)) * 100 : 0;
+  const tx = '📊 <b>Dashboard</b>\n━━━━━━━━━━━━━━\n' +
+    `💰 <b>Revenue</b>\nToday: ${f(d1)} (${cnt(d1)})\n7 days: ${f(d7)} (${cnt(d7)})\n30 days: ${f(d30)} (${cnt(d30)})\n` +
+    `Plans sold (30d): ${mix.map((x) => `${PLANS[x.plan] ? PLANS[x.plan].label : x.plan} ×${x.n}`).join(' · ') || '—'}\n\n` +
+    `👥 <b>Users</b> (${u.total})\nNew: ${u.new1} today · ${u.new7} / 7d · ${u.new30} / 30d\nActive: ${u.act1} / 24h · ${u.act7} / 7d\nBlocked bot: ${u.blocked} · Free tips ON: ${u.tips}\n\n` +
+    `💎 <b>Premium</b>\nActive: ${u.premium} (${u.expiring} expiring in 3 days)\nConversion (ever paid ÷ all users): <b>${conv.toFixed(1)}%</b> (${pay.payers} payers)\nRenewal payments (all time): ${pay.renewals}\nChurn, approx. 30d: <b>${churn.toFixed(1)}%</b> (${lapsed} lapsed vs ${u.premium} active)\n\n` +
+    `🎟 <b>Promo</b>: ${promo.active} active codes · ${promo.red30} redeemed (30d)\n📌 <b>Follows</b>: ${fol.d1} today · ${fol.users} users ever\n🛡 Self-excluded now: ${u.excluded}`;
+  await reply(ctx, tx);
+}));
+bot.command('promo', adminOnly(async (ctx) => {
+  const a = argText(ctx).split(/\s+/).filter(Boolean);
+  const sub = (a[0] || '').toLowerCase();
+  if (sub === 'create') {
+    const code = String(a[1] || '').toUpperCase();
+    const days = Math.round(Number(a[2])), max = Math.round(Number(a[3] || 1)), exp = a[4] ? Math.round(Number(a[4])) : null;
+    if (!/^[A-Z0-9_-]{3,24}$/.test(code) || !(days > 0) || !(max > 0)) return reply(ctx, 'Usage: /promo create &lt;CODE&gt; &lt;days&gt; [maxUses=1] [expiresInDays]\nExample: <code>/promo create WELCOME7 7 100 30</code>');
+    await q(`INSERT INTO promo_codes (code, days, max_uses, expires_at) VALUES ($1, $2, $3, CASE WHEN $4::int IS NULL THEN NULL ELSE now() + make_interval(days => $4::int) END)
+      ON CONFLICT (code) DO UPDATE SET days = EXCLUDED.days, max_uses = EXCLUDED.max_uses, expires_at = EXCLUDED.expires_at`, [code, days, max, exp]);
+    const me = ctx.botInfo || bot.botInfo || {};
+    return reply(ctx, `✅ Code <code>${code}</code>: ${days} day(s) Premium · ${max} use(s)${exp ? ` · expires in ${exp} day(s)` : ''}\nUsers redeem with <code>/redeem ${code}</code> or this link:\nhttps://t.me/${me.username}?start=promo_${code}`);
+  }
+  if (sub === 'list') {
+    const rows = (await q('SELECT * FROM promo_codes ORDER BY created_at DESC LIMIT 25')).rows;
+    if (!rows.length) return reply(ctx, 'No promo codes yet. Create one: /promo create &lt;CODE&gt; &lt;days&gt; [maxUses] [expiresInDays]');
+    return reply(ctx, '🎟 <b>Promo codes</b>\n' + rows.map((r) => `<code>${esc(r.code)}</code> · ${r.days}d · ${r.uses}/${r.max_uses}${r.expires_at ? ' · exp ' + fmtDate(r.expires_at) : ''}`).join('\n'));
+  }
+  if (sub === 'del' || sub === 'delete') {
+    const code = String(a[1] || '').toUpperCase();
+    const r = await q('DELETE FROM promo_codes WHERE code = $1 RETURNING code', [code]);
+    return reply(ctx, r.rows.length ? `🗑 Deleted <code>${esc(code)}</code>.` : 'Code not found.');
+  }
+  return reply(ctx, '🎟 <b>Promo codes</b>\n/promo create &lt;CODE&gt; &lt;days&gt; [maxUses=1] [expiresInDays]\n/promo list\n/promo del &lt;CODE&gt;');
+}));
+bot.command('unexclude', adminOnly(async (ctx) => {
+  const id = Number(argText(ctx));
+  if (!id) return reply(ctx, 'Usage: /unexclude &lt;userId&gt;');
+  await q('UPDATE users SET excluded_until = NULL WHERE id = $1', [id]);
+  return reply(ctx, `✅ Self-exclusion lifted for <code>${id}</code>.`);
+}));
+
 bot.catch((err) => console.error('Bot error:', err));
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
 
 const PUBLIC_COMMANDS = [
   { command: 'menu', description: 'Open the main menu' },
-  { command: 'today', description: "Today's matches with odds" },
   { command: 'best10', description: 'Best 10 picks of the day (free)' },
+  { command: 'picks', description: 'All pick lists' },
   { command: 'top5', description: 'Top 5 picks of the day (Premium)' },
   { command: 'best3', description: 'Best 3 under-the-radar picks (Premium)' },
   { command: 'best1', description: 'Best single pick of the day (Premium)' },
-  { command: 'value', description: 'Value bets (Premium)' },
-  { command: 'acca', description: 'Accumulator builder (Premium)' },
-  { command: 'goals', description: 'Goals markets (Premium)' },
-  { command: 'dc', description: 'Safer markets: DC / DNB (Premium)' },
+  { command: 'best10pro', description: 'Best 10 Pro with confidence tiers (Premium)' },
+  { command: 'potw', description: 'Pick of the Week (Premium)' },
+  { command: 'today', description: "Today's matches with odds" },
   { command: 'live', description: 'Live scores' },
   { command: 'table', description: 'League table' },
   { command: 'predict', description: 'Predict any upcoming match' },
+  { command: 'value', description: 'Value bets (Premium)' },
+  { command: 'goals', description: 'Goals markets (Premium)' },
+  { command: 'dc', description: 'Safer markets: DC / DNB (Premium)' },
+  { command: 'scores', description: 'Correct-score suggestions (Premium)' },
+  { command: 'acca', description: 'Accumulator builder (Premium)' },
+  { command: 'safe', description: 'Safe 2-odds slip (Premium)' },
+  { command: 'weekend', description: 'Weekend special acca (Premium)' },
+  { command: 'myrecord', description: 'Your followed picks and win rate' },
+  { command: 'leaders', description: 'Monthly leaderboard' },
   { command: 'watchlist', description: 'Matches you follow (Premium)' },
   { command: 'stake', description: 'Kelly stake calculator' },
   { command: 'subscribe', description: 'Daily picks in your chat (Premium)' },
   { command: 'settings', description: 'Leagues, push time, language' },
   { command: 'premium', description: 'Unlock everything' },
-  { command: 'account', description: 'Your plan and usage' },
+  { command: 'redeem', description: 'Redeem a promo code' },
   { command: 'refer', description: 'Invite friends, earn free days' },
+  { command: 'account', description: 'Your plan and usage' },
   { command: 'stats', description: 'Model accuracy & ROI' },
   { command: 'history', description: 'Recent published picks' },
   { command: 'calibration', description: 'Are the probabilities honest?' },
+  { command: 'responsible', description: 'Responsible play & self-exclusion' },
   { command: 'help', description: 'How predictions work' },
 ];
 
