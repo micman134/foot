@@ -614,6 +614,174 @@ async function getExtraFixtures(today, existing) {
   return extras;
 }
 
+// ---------- Independent score feed: ESPN + TheSportsDB (football-data only as a back-up) ----------
+// One normalised game shape: { src, league, home, away, homeFull, awayFull, hs, as, hs90, as90, status: NS|LIVE|HT|FT, minute, utc, aet }
+// Used for the Live screen AND to settle pending predictions, so a slow / rate-limited football-data no longer freezes results.
+const FD_TO_ESPN = { PL: 'eng.1', ELC: 'eng.2', BL1: 'ger.1', SA: 'ita.1', PD: 'esp.1', FL1: 'fra.1', DED: 'ned.1', PPL: 'por.1', CL: 'uefa.champions', BSA: 'bra.1' };
+const AMERICAS_RE = /^(usa|mex|arg|bra|conmebol|concacaf|col|chi|uru|per|ecu)/;
+const LIVE_USE_FD = process.env.LIVE_USE_FD === 'always'; // default: football-data is only asked when ESPN returned nothing
+const raceTimeout = (p, ms, label = 'timeout') => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label)), ms))]);
+const scoreNum = (v) => { if (v && typeof v === 'object') v = v.value != null ? v.value : v.displayValue; if (v === undefined || v === null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+
+function espnGame(ev, slug) {
+  const comp = (ev.competitions || [])[0];
+  if (!comp) return null;
+  const h = (comp.competitors || []).find((c) => c.homeAway === 'home');
+  const a = (comp.competitors || []).find((c) => c.homeAway === 'away');
+  if (!h || !a || !h.team || !a.team) return null;
+  const stt = (ev.status && ev.status.type) || (comp.status && comp.status.type) || {};
+  const nm = String(stt.name || ''), state = stt.state || 'pre';
+  let status = 'NS';
+  if (state === 'in') status = /HALFTIME/i.test(nm) ? 'HT' : 'LIVE';
+  else if (state === 'post') status = stt.completed === false || /POSTPONED|CANCEL|ABANDON|SUSPEND|FORFEIT|DELAY/i.test(nm) ? 'X' : 'FT';
+  if (status === 'X') return null;
+  const hs = scoreNum(h.score), as = scoreNum(a.score);
+  const aet = /AET|PEN|SHOOT|EXTRA/i.test(nm);
+  let hs90 = null, as90 = null;
+  if (status === 'FT') {
+    if (!aet) { hs90 = hs; as90 = as; }
+    else { // extra time / penalties: the 90-minute score is the first two periods
+      const l1 = (h.linescores || []).map(scoreNum), l2 = (a.linescores || []).map(scoreNum);
+      if (l1.length >= 2 && l2.length >= 2 && l1[0] != null && l1[1] != null && l2[0] != null && l2[1] != null) { hs90 = l1[0] + l1[1]; as90 = l2[0] + l2[1]; }
+    }
+  }
+  const clock = String((ev.status && ev.status.displayClock) || '').trim();
+  return {
+    src: 'espn', slug, league: ESPN_LEAGUES[slug] || slug,
+    home: h.team.shortDisplayName || h.team.displayName, away: a.team.shortDisplayName || a.team.displayName,
+    homeFull: h.team.displayName || h.team.shortDisplayName, awayFull: a.team.displayName || a.team.shortDisplayName,
+    hs, as, hs90, as90, status, minute: status === 'LIVE' && clock && clock !== "0'" ? clock : '', utc: new Date(ev.date).getTime(), aet,
+  };
+}
+async function espnFeed(dates, budgetMs = 22000) { // dates: [{ s: 'YYYYMMDD', onlyAm }]; returns whatever finished inside the time budget
+  const jobs = [];
+  for (const slug of Object.keys(ESPN_LEAGUES)) for (const d of dates) { if (d.onlyAm && !AMERICAS_RE.test(slug)) continue; jobs.push([slug, d.s]); }
+  const out = [], st = { ok: 0, fail: 0, firstErr: '' };
+  const work = pool(jobs, 8, async ([slug, d]) => {
+    try {
+      const data = await espnJson(slug, d);
+      st.ok++;
+      for (const ev of data.events || []) { const g = espnGame(ev, slug); if (g && Number.isFinite(g.utc)) out.push(g); }
+    } catch (e) { if (!e.missing) { st.fail++; if (!st.firstErr) st.firstErr = `${slug}: ${e.message}`; } }
+  });
+  await Promise.race([work, sleep(budgetMs)]);
+  return { games: out.slice(), ...st, jobs: jobs.length };
+}
+async function sdbFeed(dayStr) { // TheSportsDB: every soccer league for a day in one call
+  let res = null;
+  for (const key of ['3', '123']) {
+    res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/${key}/eventsday.php?d=${dayStr}&s=Soccer`, { headers: FEED_HEADERS }, 15000, 2);
+    if (res.ok) break;
+  }
+  if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+  const data = await res.json();
+  const out = [], now = Date.now();
+  for (const ev of data.events || []) {
+    if (!ev.strHomeTeam || !ev.strAwayTeam) continue;
+    const s = String(ev.strStatus || '').trim().toLowerCase();
+    if (/postp|cancel|abandon|susp|awarded/.test(s)) continue;
+    const iso = ev.strTimestamp ? ev.strTimestamp : `${ev.dateEvent}T${ev.strTime || '12:00:00'}`;
+    const utc = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + 'Z').getTime();
+    if (!Number.isFinite(utc)) continue;
+    const hs = scoreNum(ev.intHomeScore), as = scoreNum(ev.intAwayScore);
+    let status = 'NS';
+    if (/^(ft|match finished|finished|aet|aot|pen|after extra|after pen)/.test(s)) status = 'FT';
+    else if (/^(ht|half ?time)/.test(s)) status = 'HT';
+    else if (/^(1h|2h|et|live|in play|\d)/.test(s) || (hs != null && as != null && !/^(ns|not started)/.test(s))) status = now - utc > 3.5 * 3600e3 ? 'FT' : 'LIVE';
+    const aet = /aet|aot|pen|extra/.test(s);
+    out.push({
+      src: 'sdb', slug: null, league: ev.strLeague || 'Other football', home: ev.strHomeTeam, away: ev.strAwayTeam, homeFull: ev.strHomeTeam, awayFull: ev.strAwayTeam,
+      hs, as, hs90: status === 'FT' && !aet ? hs : null, as90: status === 'FT' && !aet ? as : null, status, minute: '', utc, aet,
+    });
+  }
+  return out;
+}
+async function fdFeed() { // back-up only: shares the 10 requests/minute football-data budget
+  const from = localDate(new Date(Date.now() - 864e5)), to = localDate(new Date(Date.now() + 864e5));
+  const data = await fdGet(`/matches?dateFrom=${from}&dateTo=${to}`);
+  return (data.matches || []).map((m) => {
+    const sc = (m.score && m.score.fullTime) || {};
+    const status = ['IN_PLAY', 'LIVE'].includes(m.status) ? 'LIVE' : m.status === 'PAUSED' ? 'HT' : m.status === 'FINISHED' ? 'FT' : 'NS';
+    const reg = (m.score && m.score.regularTime) || sc;
+    return {
+      src: 'fd', slug: null, league: m.competition.name, home: m.homeTeam.shortName || m.homeTeam.name, away: m.awayTeam.shortName || m.awayTeam.name,
+      homeFull: m.homeTeam.name, awayFull: m.awayTeam.name, hs: sc.home == null ? null : sc.home, as: sc.away == null ? null : sc.away,
+      hs90: status === 'FT' && reg.home != null ? reg.home : null, as90: status === 'FT' && reg.away != null ? reg.away : null,
+      status, minute: '', utc: new Date(m.utcDate).getTime(), aet: false,
+    };
+  });
+}
+const gameSame = (a, b) => Math.abs(a.utc - b.utc) < 3 * 3600e3 && nameScore(a.homeFull, b.homeFull) >= 0.99 && nameScore(a.awayFull, b.awayFull) >= 0.99;
+function mergeGames(lists) { // lists in priority order; for a duplicate keep the most advanced status (NS < LIVE/HT < FT)
+  const RANK = { NS: 0, LIVE: 1, HT: 1, FT: 2 };
+  const out = [];
+  for (const list of lists) for (const g of list) {
+    const ex = out.find((x) => gameSame(x, g));
+    if (!ex) { out.push({ ...g }); continue; }
+    if (RANK[g.status] > RANK[ex.status]) Object.assign(ex, { hs: g.hs, as: g.as, hs90: g.hs90, as90: g.as90, status: g.status, minute: g.minute, aet: g.aet });
+    else if (RANK[g.status] === RANK[ex.status] && ex.status !== 'NS' && (ex.hs == null || ex.as == null) && g.hs != null) Object.assign(ex, { hs: g.hs, as: g.as });
+  }
+  return out;
+}
+const feedDiag = { at: 0, espn: '-', sdb: '-', fd: '-' };
+function getGames() {
+  return cached('feed:games', LIVE_CACHE_MS, async () => {
+    const hr = new Date().getUTCHours();
+    const dates = [{ s: ymd(Date.now()), onlyAm: false }, { s: ymd(Date.now() - 864e5), onlyAm: hr >= 5 }]; // early UTC hours: yesterday's late games are still running everywhere
+    const sdbDays = [0, -1].map((d) => new Date(Date.now() + d * 864e5).toISOString().slice(0, 10));
+    const [e, s] = await Promise.allSettled([espnFeed(dates), Promise.all(sdbDays.map(sdbFeed)).then((a) => a.flat())]);
+    const lists = [], ok = {};
+    if (e.status === 'fulfilled') { lists.push(e.value.games); ok.espn = e.value.ok > 0; feedDiag.espn = `${e.value.games.length} games, ${e.value.ok}/${e.value.jobs} requests ok${e.value.firstErr ? ', first error ' + e.value.firstErr : ''}`; }
+    else { ok.espn = false; feedDiag.espn = 'failed: ' + e.reason.message; }
+    if (s.status === 'fulfilled') { lists.push(s.value); ok.sdb = true; feedDiag.sdb = `${s.value.length} games`; }
+    else { ok.sdb = false; feedDiag.sdb = 'failed: ' + s.reason.message; }
+    const espnN = e.status === 'fulfilled' ? e.value.games.length : 0;
+    if (LIVE_USE_FD || !espnN) {
+      try { const f = await raceTimeout(fdFeed(), 9000); lists.push(f); ok.fd = true; feedDiag.fd = `${f.length} games`; }
+      catch (err) { ok.fd = false; feedDiag.fd = 'failed: ' + err.message; }
+    } else { ok.fd = null; feedDiag.fd = 'not needed (ESPN answered)'; }
+    feedDiag.at = Date.now();
+    if (!lists.length) throw new Error('no score source reachable');
+    return { at: Date.now(), games: mergeGames(lists), ok };
+  });
+}
+async function resolveFromFeed(open) { // settle open predictions from ESPN / TheSportsDB finished games
+  const now = Date.now();
+  const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
+  const espnNeeds = new Map(), sdbDays = new Set();
+  for (const r of open) {
+    const slug = String(r.comp).startsWith('X:') ? (ESPN_LEAGUES[String(r.comp).slice(2)] ? String(r.comp).slice(2) : null) : FD_TO_ESPN[r.comp] || null;
+    const days = [...new Set([dayOf(r.utc), dayOf(r.utc + 6 * 3600e3)])];
+    for (const d of days) {
+      if (slug) espnNeeds.set(slug + '|' + d, [slug, d]);
+      if (!slug || now - r.utc > 8 * 3600e3) sdbDays.add(d); // second opinion for anything that is still open after 8 hours
+    }
+  }
+  const games = [];
+  await pool([...espnNeeds.values()], 6, async ([slug, d]) => {
+    try {
+      const list = await cached(`feedres:espn:${slug}:${d}`, 15 * 60e3, async () => (((await espnJson(slug, d.replace(/-/g, ''))).events || []).map((ev) => espnGame(ev, slug)).filter(Boolean)));
+      games.push(...list);
+    } catch (e) { if (!e.missing) console.log('Result feed (ESPN) failed', slug, d, e.message); }
+  });
+  await pool([...sdbDays], 3, async (d) => {
+    try { games.push(...(await cached(`feedres:sdb:${d}`, 15 * 60e3, () => sdbFeed(d)))); }
+    catch (e) { console.log('Result feed (TheSportsDB) failed', d, e.message); }
+  });
+  const sameTeams = (r, g) => (nameScore(r.home, g.home) >= 0.99 || nameScore(r.home, g.homeFull) >= 0.99) && (nameScore(r.away, g.away) >= 0.99 || nameScore(r.away, g.awayFull) >= 0.99);
+  const changed = [];
+  for (const r of open) {
+    const hits = games.filter((g) => g.status === 'FT' && g.hs90 != null && g.as90 != null && Math.abs(g.utc - r.utc) < 8 * 3600e3 && sameTeams(r, g));
+    if (!hits.length) continue;
+    const g = hits.find((x) => x.src === 'espn') || hits[0];
+    r.res = g.hs90 > g.as90 ? 'H' : g.hs90 < g.as90 ? 'A' : 'D';
+    r.score = `${g.hs90}-${g.as90}`;
+    predDirty.add(r.id);
+    changed.push(r);
+  }
+  return changed;
+}
+
 // ---------- Today's matches ----------
 let nextInfo = null; // next match day after today (shown when today is empty)
 function getMatchesToday() {
@@ -1347,6 +1515,10 @@ async function resolveLog() {
         changed.push(r);
       }
     }
+  }
+  const still = open.filter((r) => !r.res);
+  if (still.length) { // football-data lagging, rate-limited or not covering the league: settle from ESPN / TheSportsDB instead
+    try { changed.push(...(await resolveFromFeed(still))); } catch (e) { console.log('Feed settle failed:', e.message); }
   }
   if (changed.length) savePredLog();
   return changed;
@@ -2322,9 +2494,27 @@ const MK_CATS = {
   hcp: { short: 'Handicaps', icon: '📐', title: 'Handicaps', sub: '1 (-1) · 2 (+1) · Asian handicap', groups: ['eu', 'ah'] },
 };
 
+const lamCache = new Map();
+function fitLambdas(f) { // goal rates that reproduce a 1X2 split (used when a match has odds but no team-stats data)
+  const key = [f.H, f.D, f.A].map((x) => x.toFixed(3)).join('|');
+  if (lamCache.has(key)) return lamCache.get(key);
+  let best = null;
+  for (let lh = 0.2; lh <= 3.6; lh += 0.1) for (let la = 0.2; la <= 3.0; la += 0.1) {
+    const p = poisson1x2(lh, la);
+    const e = (p.H - f.H) ** 2 + (p.D - f.D) ** 2 + (p.A - f.A) ** 2 + 0.002 * (lh + la - 2.7) ** 2;
+    if (!best || e < best.e) best = { e, lh, la };
+  }
+  const out = { lh: best.lh, la: best.la };
+  if (lamCache.size > 500) lamCache.clear();
+  lamCache.set(key, out);
+  return out;
+}
 function buildMarkets(m, st) {
-  if (!st || !st.form) return null;
-  const { lh, la } = st.form;
+  if (!st) return null;
+  const approx = !st.form;
+  const rates = st.form || (st.final ? fitLambdas(st.final) : null);
+  if (!rates) return null;
+  const { lh, la } = rates;
   let grid = scoreGrid(lh, la);
   if (st.final) grid = tiltGrid(grid, st.final);
   const H = m.home, A = m.away;
@@ -2405,7 +2595,7 @@ function buildMarkets(m, st) {
   const cMu = CORNERS_AVG * (1 + tilt), kMu = CARDS_AVG * (1 - tilt / 2);
   for (const L of [8.5, 9.5, 10.5, 11.5]) { const o = nbOver(cMu, 1.5, L); add('cc', 'corners', `Corners OV ${L}`, `${Math.floor(L) + 1}+ corners`, o); add('cc', 'corners', `Corners UN ${L}`, `${Math.floor(L)} or fewer corners`, 1 - o); }
   for (const L of [2.5, 3.5, 4.5, 5.5]) { const o = nbOver(kMu, 1.3, L); add('cc', 'cards', `Cards OV ${L}`, `${Math.floor(L) + 1}+ bookings`, o); add('cc', 'cards', `Cards UN ${L}`, `${Math.floor(L)} or fewer bookings`, 1 - o); }
-  return { mk, lh, la, grid, cMu, kMu };
+  return { mk, lh, la, grid, cMu, kMu, approx };
 }
 
 const mkLine = (x) => `<b>${esc(x.code)}</b> ${esc(x.desc)} — <b>${pct(x.p)}%</b> · fair ${fair(x.p)}` + (x.push != null && x.push >= 0.05 ? ` · stake back ${pct(x.push)}%` : '');
@@ -2414,9 +2604,13 @@ const mkLine = (x) => `<b>${esc(x.code)}</b> ${esc(x.desc)} — <b>${pct(x.p)}%<
 async function renderMarketBoard(u, cat) {
   const C = MK_CATS[cat];
   const rows = [];
-  for (const { m, st } of byLeague(await analysedToday(), u)) {
+  const all = await analysedToday();
+  const mine = byLeague(all, u);
+  let modelled = 0;
+  for (const { m, st } of mine) {
     const b = buildMarkets(m, st);
     if (!b) continue;
+    modelled++;
     const lines = [];
     for (const g of C.groups) {
       const [lo, hi] = GROUP_BAND[g] || [MK_MIN_P, MK_MAX_P];
@@ -2426,14 +2620,21 @@ async function renderMarketBoard(u, cat) {
     if (lines.length) rows.push({ m, st, b, lines, score: Math.max(...lines.map((l) => l.x.p / (GROUP_BAND[l.g] ? GROUP_BAND[l.g][0] : 1))) });
   }
   rows.sort((a, c) => c.score - a.score);
-  if (!rows.length) return `${C.icon} <b>${C.title}</b>\n\nNothing clears the probability bar today.\n\n` + t(u, 'disc');
+  if (!rows.length) {
+    const why = !all.length ? 'No matches left to play today — everything has kicked off or been played. Check back when tomorrow\'s fixtures load (or open /today).'
+      : !mine.length ? `${all.length} match${all.length === 1 ? '' : 'es'} left today, but none in your selected leagues. Change that in ⚙️ Settings → Leagues.`
+      : !modelled ? 'The remaining matches have no odds or team data yet, so they cannot be priced.'
+      : `${modelled} match${modelled === 1 ? '' : 'es'} priced, but none has a market inside the ${C.short} probability band right now.`;
+    return `${C.icon} <b>${C.title}</b>\n\n${why}\n\n` + t(u, 'disc');
+  }
   let tx = `${C.icon} <b>${C.title}</b>\n<i>${C.sub}. Chances come from the goal model tuned to the blended 1X2. Fair odds = 1 ÷ chance — only bet if your bookie pays MORE. Tap a match below for every market.</i>\n\n`;
   const shown = rows.slice(0, 8);
   shown.forEach(({ m, b, lines }, i) => {
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
     for (const { g, x } of lines) tx += `   ▸ <i>${GROUP_TITLE[g]}</i> · ${mkLine(x)}\n`;
-    tx += `   ⚽ Expected goals ${b.lh.toFixed(1)}–${b.la.toFixed(1)}\n\n`;
+    tx += `   ⚽ Expected goals ${b.approx ? '≈' : ''}${b.lh.toFixed(1)}–${b.la.toFixed(1)}\n\n`;
   });
+  if (shown.some((r) => r.b.approx)) tx += '<i>≈ = goal rates inferred from the bookmaker 1X2 odds (no team-stats data for that match).</i>\n\n';
   const nums = shown.map((r, i) => Markup.button.callback(`${i + 1} 📋`, `am:${r.m.id}`));
   const kbRows = [];
   for (let i = 0; i < nums.length; i += 4) kbRows.push(nums.slice(i, i + 4));
@@ -2450,7 +2651,7 @@ async function renderAllMarkets(m, u) {
   if (!b) return { text: tx + '\nNot enough data to price this match.\n\n' + t(u, 'disc'), kb: null };
   const g = (grp, cat) => b.mk.filter((x) => x.group === grp && (!cat || x.cat === cat));
   const row = (arr, f = (x) => `${x.code} ${pct(x.p)}%`) => arr.map(f).join(' · ');
-  tx += `⚽ Expected goals ${b.lh.toFixed(1)}–${b.la.toFixed(1)}\n<i>Fair odds = 100 ÷ chance (50% → 2.00). Bet only if the bookie pays more.</i>\n`;
+  tx += `⚽ Expected goals ${b.approx ? '≈' : ''}${b.lh.toFixed(1)}–${b.la.toFixed(1)}${b.approx ? ' <i>(inferred from the 1X2 odds — no team-stats data)</i>' : ''}\n<i>Fair odds = 100 ÷ chance (50% → 2.00). Bet only if the bookie pays more.</i>\n`;
   tx += `\n🏁 <b>Result</b>\n1X2: ${row(g('x12'))}\nDouble chance: ${row(g('dc'))}\nDraw no bet: ${row(g('dnb'), (x) => `${x.code} ${pct(x.p)}%`)} <i>(stake back on a draw ${pct(g('dnb')[0].push)}%)</i>\n`;
   tx += `\n⚽ <b>Goals</b>\nBTTS: ${row(g('bts'))}\n`;
   for (const L of [0.5, 1.5, 2.5, 3.5]) { const o = b.mk.find((x) => x.code === `OV ${L}`), un = b.mk.find((x) => x.code === `UN ${L}`); tx += `${L}: Over ${pct(o.p)}% (fair ${fair(o.p)}) · Under ${pct(un.p)}% (fair ${fair(un.p)})\n`; }
@@ -2475,39 +2676,50 @@ async function renderAllMarkets(m, u) {
 
 // ----- Live scores -----
 const LIVE_CACHE_MS = Number(process.env.LIVE_CACHE_MS || 30e3); // how long a live-score fetch is shared between users
-function getLive() {
-  return cached('live', LIVE_CACHE_MS, async () => {
-    const from = localDate(new Date(Date.now() - 864e5)), to = localDate(new Date(Date.now() + 864e5));
-    const data = await fdGet(`/matches?dateFrom=${from}&dateTo=${to}`);
-    const today = localDate(new Date()), now = Date.now();
-    const list = (data.matches || []).filter((m) => {
-      const ko = new Date(m.utcDate).getTime();
-      if (['IN_PLAY', 'PAUSED', 'LIVE'].includes(m.status)) return true; // live, even if it started before midnight
-      if (m.status === 'FINISHED') return localDate(new Date(ko)) === today;
-      return ['TIMED', 'SCHEDULED'].includes(m.status) && ko <= now && now - ko < 3 * 3600e3; // kicked off but the feed has not caught up
-    });
-    return { at: Date.now(), list };
+async function getLive() {
+  const f = await getGames();
+  const today = localDate(new Date()), now = Date.now();
+  const list = f.games.filter((g) => {
+    if (g.status === 'LIVE' || g.status === 'HT') return g.hs != null || now - g.utc < 3 * 3600e3;
+    if (g.status === 'FT') return localDate(new Date(g.utc)) === today || g.utc > now - 6 * 3600e3;
+    return g.status === 'NS' && g.utc <= now && now - g.utc < 3 * 3600e3; // kicked off but no source has the score yet
   });
+  return { at: f.at, list, ok: f.ok };
 }
 const liveKb = () => Markup.inlineKeyboard([[Markup.button.callback('🔄 Refresh', 'live')], [Markup.button.callback('⚽ Today', 'today'), Markup.button.callback('🏠 Menu', 'menu')]]);
 async function renderLive() {
-  const { at, list } = await getLive();
+  const { at, list, ok } = await getLive();
   const stamp = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(at));
-  if (!list.length) return { text: `🔴 <b>Scores</b>\n\nNo live or finished matches yet today in the covered leagues.\n\n🕒 Updated ${stamp}`, kb: liveKb() };
-  const isLive = (m) => ['IN_PLAY', 'PAUSED', 'LIVE'].includes(m.status);
-  const waiting = list.filter((m) => !isLive(m) && m.status !== 'FINISHED');
-  let tx = `🔴 <b>Scores</b> — ${list.filter(isLive).length} live · ${list.filter((m) => m.status === 'FINISHED').length} finished` + (waiting.length ? ` · ${waiting.length} awaiting feed` : '') + '\n';
-  let last = '';
-  for (const m of list.sort((a, b) => a.competition.name.localeCompare(b.competition.name) || new Date(a.utcDate) - new Date(b.utcDate))) {
-    if (m.competition.name !== last) { tx += `\n🏆 <b>${esc(m.competition.name)}</b>\n`; last = m.competition.name; }
-    const hn = esc(m.homeTeam.shortName || m.homeTeam.name), an = esc(m.awayTeam.shortName || m.awayTeam.name);
-    if (!isLive(m) && m.status !== 'FINISHED') { tx += `⏳ ${hn} vs ${an} — kicked off ${fmtTime(new Date(m.utcDate).getTime())}, score not in the feed yet\n`; continue; }
-    const sc = m.score && m.score.fullTime ? m.score.fullTime : {};
-    const tag = m.status === 'FINISHED' ? '✅ FT' : m.status === 'PAUSED' ? '⏸ HT' : '🔴 LIVE';
-    tx += `${tag} ${hn} <b>${sc.home == null ? 0 : sc.home}-${sc.away == null ? 0 : sc.away}</b> ${an}\n`;
-  }
-  tx += `\n🕒 Updated ${stamp} (${TZ}) · tap 🔄 to refresh`;
-  if (waiting.length) tx += '\n<i>Some scores lag behind the real match: the football-data.org feed on the free plan is delayed by a few minutes.</i>';
+  const mark = (v) => (v === null ? '–' : v ? '✓' : '✗');
+  const srcLine = `📡 ESPN ${mark(ok.espn)} · TheSportsDB ${mark(ok.sdb)} · football-data ${mark(ok.fd)}`;
+  if (!list.length) return { text: `🔴 <b>Scores</b>\n\nNo live or finished matches right now in the covered leagues.\n\n🕒 Updated ${stamp}\n${srcLine}`, kb: liveKb() };
+  const live = list.filter((g) => g.status === 'LIVE' || g.status === 'HT');
+  const done = list.filter((g) => g.status === 'FT');
+  const wait = list.filter((g) => g.status === 'NS');
+  const line = (g) => {
+    const hn = esc(g.home), an = esc(g.away);
+    if (g.status === 'NS') return `⏳ ${hn} vs ${an} — kicked off ${fmtTime(g.utc)}, no score yet\n`;
+    const sc = `<b>${g.hs == null ? 0 : g.hs}-${g.as == null ? 0 : g.as}</b>`;
+    const tag = g.status === 'FT' ? (g.aet ? '✅ AET' : '✅ FT') : g.status === 'HT' ? '⏸ HT' : g.minute ? `🔴 ${esc(g.minute)}` : '🔴 LIVE';
+    return `${tag} ${hn} ${sc} ${an}\n`;
+  };
+  const section = (title, arr, max) => {
+    if (!arr.length) return '';
+    let out = `\n${title}\n`, last = '';
+    const sorted = arr.slice().sort((a, b) => String(a.league).localeCompare(String(b.league)) || a.utc - b.utc);
+    for (const g of sorted.slice(0, max)) {
+      if (g.league !== last) { out += `🏆 <b>${esc(g.league)}</b>\n`; last = g.league; }
+      out += line(g);
+    }
+    if (arr.length > max) out += `…and ${arr.length - max} more\n`;
+    return out;
+  };
+  let tx = `🔴 <b>Scores</b> — ${live.length} live · ${done.length} finished` + (wait.length ? ` · ${wait.length} awaiting score` : '') + '\n';
+  tx += section('<b>Live now</b>', live, 40);
+  tx += section('<b>Finished</b>', done.sort((a, b) => b.utc - a.utc).slice(0, 45), 45);
+  tx += section('<b>Waiting for a score</b>', wait, 10);
+  if (tx.length > 3550) tx = tx.slice(0, tx.lastIndexOf('\n', 3500)) + '\n…list shortened';
+  tx += `\n🕒 Updated ${stamp} (${TZ}) · tap 🔄 to refresh\n${srcLine}`;
   return { text: tx, kb: liveKb() };
 }
 const liveH = async (ctx) => {
@@ -3562,8 +3774,24 @@ bot.on('inline_query', async (ctx) => {
 // ----- admin tools (admins have every feature, no limits) -----
 const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
-  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/forceupdate – clear caches\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
+  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
 bot.command('admin', adminOnly((ctx) => reply(ctx, ADMIN_HELP)));
+bot.command('resolve', adminOnly(detach(async (ctx) => {
+  const now = Date.now();
+  const openNow = () => predLog.filter((r) => !r.res && r.utc < now - 3 * 3600e3 && r.utc > now - 5 * 864e5);
+  const before = openNow().length;
+  cache.forEach((v, k) => { if (k.startsWith('feedres:') || k === 'feed:games') cache.delete(k); });
+  const changed = await resolveLog();
+  const left = openNow();
+  let tx = `✅ Settled <b>${changed.length}</b> of ${before} open matches.`;
+  if (left.length) tx += `\n⏳ Still pending (${left.length}):\n` + left.slice(0, 15).map((r) => `• ${esc(r.home)} vs ${esc(r.away)} (${esc(r.comp)}, ${fmtDate(r.utc)})`).join('\n');
+  await reply(ctx, tx);
+})));
+bot.command('feedstatus', adminOnly(detach(async (ctx) => {
+  cache.delete('feed:games');
+  try { await getGames(); } catch (e) { /* diag below shows why */ }
+  await reply(ctx, `📡 <b>Score feed</b> (updated ${fmtTime(feedDiag.at || Date.now())})\nESPN: ${esc(feedDiag.espn)}\nTheSportsDB: ${esc(feedDiag.sdb)}\nfootball-data: ${esc(feedDiag.fd)}`);
+})));
 bot.command('users', adminOnly(async (ctx) => {
   const s = (await q(`SELECT count(*)::int total, count(*) FILTER (WHERE plan_until > now())::int premium, count(*) FILTER (WHERE sub_daily)::int subs,
     count(*) FILTER (WHERE joined_at > now() - interval '1 day')::int new24, count(*) FILTER (WHERE last_seen > now() - interval '1 day')::int active24,
