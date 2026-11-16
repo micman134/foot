@@ -1607,7 +1607,7 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
   "/menu – main menu\n/best10 – 10 free picks · /picks – all pick lists\n/top5 · /best3 · /best1 – top picks (Premium)\n/best10pro · /potw – Pro list &amp; pick of the week (Premium)\n" +
-  '/today · /live · /table · /predict\n/value · /goals · /dc · /scores – markets (Premium)\n/acca · /safe · /weekend – accumulators (Premium)\n' +
+  '/today · /live · /table · /predict\n/value · /goals · /dc · /scores – markets (Premium)\n/result · /htft · /combos · /handicaps · /market – full market boards (Premium)\n/acca · /safe · /weekend – accumulators (Premium)\n' +
   '/myrecord · /leaders – track your picks\n/watchlist · /subscribe · /stake\n/premium · /redeem · /refer · /account · /settings · /lang\n' +
   '/stats · /history · /calibration – model track record\n/responsible – stay in control · /help';
 const TX = {
@@ -2045,6 +2045,7 @@ async function renderDetailFor(m, backData, u) {
   } else tx += 'Not enough data to predict this one.\n';
   tx += '\n' + t(u, 'disc');
   const rows = [[Markup.button.callback('⭐ Watch', `w:${m.id}`), Markup.button.callback('🔁 H2H history', `h2h:${m.id}`)]];
+  rows.push([Markup.button.callback((hasPremium(u) ? '' : '🔒 ') + '📋 All markets (GG, O/U, HT/FT, handicaps…)', `am:${m.id}`)]);
   if (backData) rows.push([Markup.button.callback('⬅️ Back to list', backData)]);
   rows.push([Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
@@ -2253,6 +2254,223 @@ async function renderDC(u) {
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)} · ${esc(m.compName)}\n   🛡 Double chance <b>${dc[0]}</b> (${esc(dc[1])}) — ${pct(dc[2])}% · fair ${fair(dc[2])}\n   ↩️ Draw No Bet <b>${esc(team)}</b> — wins ${pct(dnb)}% of non-draws · fair ${fair(dnb)} (stake back on a draw)\n\n`;
   });
   return tx + t(u, 'disc');
+}
+
+
+// ===================== FULL MARKET ENGINE =====================
+// Every market below comes from ONE score grid (Dixon-Coles), re-weighted so its 1X2 matches the blended final probabilities.
+// Halves use independent Poisson grids. Only 1X2 has real bookmaker odds, so everything else shows model "fair odds" (1 ÷ probability).
+const HT_SHARE = Number(process.env.HT_SHARE || 0.45);        // share of a match's goals scored before half-time
+const CORNERS_AVG = Number(process.env.CORNERS_AVG || 10);    // league-average total corners per match (no live corner feed)
+const CARDS_AVG = Number(process.env.CARDS_AVG || 4.2);       // league-average bookings per match (yellow = 1, red = 1)
+const MK_MIN_P = Number(process.env.MK_MIN_P || 0.55);        // default band shown on the daily market boards
+const MK_MAX_P = Number(process.env.MK_MAX_P || 0.82);        // above this the price is too short to matter
+
+function tiltGrid(grid, f) { // re-weight score cells so P(home win / draw / away win) equals f
+  const G = { H: 0, D: 0, A: 0 };
+  grid.forEach((row, i) => row.forEach((p, j) => { G[i > j ? 'H' : i === j ? 'D' : 'A'] += p; }));
+  let tot = 0;
+  const out = grid.map((row, i) => row.map((p, j) => {
+    const k = i > j ? 'H' : i === j ? 'D' : 'A';
+    const v = G[k] > 0 ? p * (f[k] / G[k]) : p;
+    tot += v;
+    return v;
+  }));
+  return out.map((row) => row.map((p) => p / tot));
+}
+const gridSum = (grid, fn) => { let s = 0; grid.forEach((row, i) => row.forEach((p, j) => { if (fn(i, j)) s += p; })); return s; };
+const transpose = (grid) => grid[0].map((_, j) => grid.map((row) => row[j]));
+function diffDist(grid) { // distribution of (home - away) goals
+  const d = new Map();
+  grid.forEach((row, i) => row.forEach((p, j) => d.set(i - j, (d.get(i - j) || 0) + p)));
+  return d;
+}
+function ahProb(grid, line) { // Asian handicap applied to the HOME side. Returns win / push / lose (quarter lines = half stake on each neighbour)
+  const one = (h) => {
+    let w = 0, pu = 0, l = 0;
+    grid.forEach((row, i) => row.forEach((p, j) => { const d = i - j + h; if (d > 1e-9) w += p; else if (d < -1e-9) l += p; else pu += p; }));
+    return { w, pu, l };
+  };
+  const q = Math.round(line * 4) / 4;
+  if (Math.abs(q * 2 - Math.round(q * 2)) < 1e-9) return one(q);
+  const a = one(q - 0.25), b = one(q + 0.25);
+  return { w: (a.w + b.w) / 2, pu: (a.pu + b.pu) / 2, l: (a.l + b.l) / 2 };
+}
+function nbOver(mu, disp, line) { // P(total > line) for corners / cards: negative binomial (over-dispersed vs Poisson)
+  const r = mu / (disp - 1);
+  let pk = Math.pow(r / (r + mu), r), cum = pk;
+  for (let k = 0; k < Math.floor(line); k++) { pk = (pk * (k + r) / (k + 1)) * (mu / (r + mu)); cum += pk; }
+  return 1 - cum;
+}
+const signOf = (d) => (d > 0 ? '1' : d < 0 ? '2' : 'X');
+const fmtLine = (x) => (x > 0 ? '+' : '') + x;
+
+// GROUP_BAND: [min, max] probability a pick must sit in to appear on a daily board (low-probability groups get a lower floor)
+const GROUP_BAND = {
+  x12: [MK_MIN_P, MK_MAX_P], dc: [0.68, MK_MAX_P], dnb: [MK_MIN_P, MK_MAX_P],
+  ou: [MK_MIN_P, MK_MAX_P], bts: [MK_MIN_P, MK_MAX_P], team: [MK_MIN_P, MK_MAX_P], multi: [0.5, MK_MAX_P],
+  htft: [0.2, 0.9], half: [0.45, MK_MAX_P], weh: [MK_MIN_P, MK_MAX_P], sbh: [0.35, MK_MAX_P],
+  cgg: [0.35, 0.8], cov: [0.35, 0.8],
+  eu: [0.45, MK_MAX_P], ah: [MK_MIN_P, MK_MAX_P],
+};
+const GROUP_TITLE = { x12: '1X2', dc: 'Double chance', dnb: 'Draw no bet', ou: 'Over / Under', bts: 'Both teams to score', team: 'Team goals', multi: 'Multi-goals', htft: 'HT/FT', half: 'Half result', weh: 'Win either half', sbh: 'Score both halves', cgg: 'Result & BTTS', cov: 'Result & goals', eu: 'Handicap (3-way)', ah: 'Asian handicap' };
+const MK_CATS = {
+  res: { short: 'Result', icon: '🏁', title: 'Result markets', sub: '1X2 · Double Chance · Draw No Bet', groups: ['x12', 'dc', 'dnb'] },
+  goals: { short: 'Goals', icon: '⚽', title: 'Goals markets', sub: 'GG/NG · Over/Under 0.5–3.5 · team goals · multi-goals', groups: ['ou', 'bts', 'team', 'multi'] },
+  htft: { short: 'HT/FT', icon: '⏱', title: 'Half-time / Full-time', sub: 'HT/FT · HT · 2HT · win either half · score both halves', groups: ['htft', 'half', 'weh', 'sbh'] },
+  combo: { short: 'Combos', icon: '🧩', title: 'Combo markets', sub: 'Result & GG · Result & Over/Under', groups: ['cgg', 'cov'] },
+  hcp: { short: 'Handicaps', icon: '📐', title: 'Handicaps', sub: '1 (-1) · 2 (+1) · Asian handicap', groups: ['eu', 'ah'] },
+};
+
+function buildMarkets(m, st) {
+  if (!st || !st.form) return null;
+  const { lh, la } = st.form;
+  let grid = scoreGrid(lh, la);
+  if (st.final) grid = tiltGrid(grid, st.final);
+  const H = m.home, A = m.away;
+  const mk = [];
+  const add = (cat, group, code, desc, p, extra = {}) => mk.push({ cat, group, code, desc, p, ...extra });
+  const P = (fn) => gridSum(grid, fn);
+  const tg = (i, j) => i + j;
+
+  // 1) result, double chance, DNB
+  const pH = P((i, j) => i > j), pD = P((i, j) => i === j), pA = P((i, j) => i < j);
+  add('res', 'x12', '1', `${H} win`, pH); add('res', 'x12', 'X', 'Draw', pD); add('res', 'x12', '2', `${A} win`, pA);
+  add('res', 'dc', '1X', `${H} or Draw`, pH + pD); add('res', 'dc', 'X2', `${A} or Draw`, pD + pA); add('res', 'dc', '12', 'Either team wins (no draw)', pH + pA);
+  add('res', 'dnb', 'DNB 1', `${H} (stake back on a draw)`, pH / (pH + pA), { push: pD });
+  add('res', 'dnb', 'DNB 2', `${A} (stake back on a draw)`, pA / (pH + pA), { push: pD });
+
+  // 2) goals
+  const gg = P((i, j) => i > 0 && j > 0);
+  add('goals', 'bts', 'GG', 'Both teams score', gg); add('goals', 'bts', 'NG', 'Both teams do not score', 1 - gg);
+  for (const L of [0.5, 1.5, 2.5, 3.5]) {
+    const ov = P((i, j) => tg(i, j) > L);
+    add('goals', 'ou', `OV ${L}`, `Over ${L} goals (${Math.floor(L) + 1}+)`, ov, { line: L });
+    add('goals', 'ou', `UN ${L}`, `Under ${L} goals (${Math.floor(L)} or fewer)`, 1 - ov, { line: L });
+  }
+  for (const L of [0.5, 1.5]) {
+    add('goals', 'team', `Home OV ${L}`, `${H} score over ${L}`, P((i) => i > L));
+    add('goals', 'team', `Away OV ${L}`, `${A} score over ${L}`, P((i, j) => j > L));
+  }
+  for (const [a, b] of [[1, 3], [2, 4], [2, 5]]) add('goals', 'multi', `${a}–${b} goals`, `Total goals between ${a} and ${b}`, P((i, j) => tg(i, j) >= a && tg(i, j) <= b));
+
+  // 3) halves
+  const g1 = scoreGrid(lh * HT_SHARE, la * HT_SHARE), g2 = scoreGrid(lh * (1 - HT_SHARE), la * (1 - HT_SHARE));
+  const d1 = diffDist(g1), d2 = diffDist(g2);
+  const htft = {};
+  for (const [a, pa] of d1) for (const [b, pb] of d2) { const k = signOf(a) + '/' + signOf(a + b); htft[k] = (htft[k] || 0) + pa * pb; }
+  for (const k of ['1/1', 'X/1', '2/1', '1/X', 'X/X', '2/X', '1/2', 'X/2', '2/2']) {
+    const [a, b] = k.split('/');
+    const name = (s) => (s === '1' ? H : s === '2' ? A : 'draw');
+    add('htft', 'htft', k, `HT ${name(a)} → FT ${name(b)}`, htft[k] || 0);
+  }
+  const half = (g, tag, lab) => {
+    const h = gridSum(g, (i, j) => i > j), d = gridSum(g, (i, j) => i === j), a = gridSum(g, (i, j) => i < j);
+    add('htft', 'half', `${tag} 1`, `${lab}: ${H} ahead`, h); add('htft', 'half', `${tag} X`, `${lab}: level`, d); add('htft', 'half', `${tag} 2`, `${lab}: ${A} ahead`, a);
+  };
+  half(g1, 'HT', 'First half'); half(g2, '2HT', 'Second half');
+  const le = (g, f) => gridSum(g, f);
+  add('htft', 'weh', 'HWEH', `${H} win either half`, 1 - le(g1, (i, j) => i <= j) * le(g2, (i, j) => i <= j));
+  add('htft', 'weh', 'AWEH', `${A} win either half`, 1 - le(g1, (i, j) => i >= j) * le(g2, (i, j) => i >= j));
+  add('htft', 'sbh', 'SBH Home', `${H} score in both halves`, le(g1, (i) => i > 0) * le(g2, (i) => i > 0));
+  add('htft', 'sbh', 'SBH Away', `${A} score in both halves`, le(g1, (i, j) => j > 0) * le(g2, (i, j) => j > 0));
+
+  // 4) combos: result × goals filter
+  const RES = { '1': (i, j) => i > j, X: (i, j) => i === j, '2': (i, j) => i < j, '1X': (i, j) => i >= j, X2: (i, j) => i <= j, '12': (i, j) => i !== j };
+  const RDESC = { '1': `${H} win`, X: 'Draw', '2': `${A} win`, '1X': `${H} or draw`, X2: `${A} or draw`, '12': 'either team wins' };
+  const FIL = {
+    GG: ['cgg', (i, j) => i > 0 && j > 0, 'both teams score'], NG: ['cgg', (i, j) => i === 0 || j === 0, 'not both teams score'],
+    'OV 1.5': ['cov', (i, j) => tg(i, j) > 1.5, '2+ goals'], 'OV 2.5': ['cov', (i, j) => tg(i, j) > 2.5, '3+ goals'],
+    'UN 2.5': ['cov', (i, j) => tg(i, j) < 2.5, '2 or fewer goals'], 'UN 3.5': ['cov', (i, j) => tg(i, j) < 3.5, '3 or fewer goals'],
+  };
+  for (const [rk, rf] of Object.entries(RES)) for (const [fk, [grp, ff, fd]] of Object.entries(FIL)) {
+    add('combo', grp, `${rk} & ${fk}`, `${RDESC[rk]} AND ${fd}`, P((i, j) => rf(i, j) && ff(i, j)));
+  }
+
+  // 5) handicaps
+  add('hcp', 'eu', '1 (-1)', `${H} win by 2+ goals`, P((i, j) => i - j >= 2));
+  add('hcp', 'eu', '2 (-1)', `${A} win by 2+ goals`, P((i, j) => j - i >= 2));
+  add('hcp', 'eu', '2 (+1)', `${A} win or draw (starts +1)`, P((i, j) => i - j <= 0));
+  add('hcp', 'eu', '1 (+1)', `${H} win or draw (starts +1)`, P((i, j) => j - i <= 0));
+  const gridT = transpose(grid);
+  for (const [side, g, name] of [['Home', grid, H], ['Away', gridT, A]]) {
+    for (const line of [-1.5, -1, -0.75, -0.5, -0.25, 0.25, 0.5, 0.75, 1, 1.5]) {
+      const r = ahProb(g, line);
+      add('hcp', 'ah', `AH ${side} ${fmtLine(line)}`, `${name} ${fmtLine(line)}`, r.w + r.l > 0 ? r.w / (r.w + r.l) : 0, { push: r.pu, win: r.w });
+    }
+  }
+
+  // 6) corners & cards (rough: league-average totals nudged by expected goals — there is no corner/card data feed)
+  const tilt = Math.max(-0.12, Math.min(0.12, 0.05 * (lh + la - 2.7)));
+  const cMu = CORNERS_AVG * (1 + tilt), kMu = CARDS_AVG * (1 - tilt / 2);
+  for (const L of [8.5, 9.5, 10.5, 11.5]) { const o = nbOver(cMu, 1.5, L); add('cc', 'corners', `Corners OV ${L}`, `${Math.floor(L) + 1}+ corners`, o); add('cc', 'corners', `Corners UN ${L}`, `${Math.floor(L)} or fewer corners`, 1 - o); }
+  for (const L of [2.5, 3.5, 4.5, 5.5]) { const o = nbOver(kMu, 1.3, L); add('cc', 'cards', `Cards OV ${L}`, `${Math.floor(L) + 1}+ bookings`, o); add('cc', 'cards', `Cards UN ${L}`, `${Math.floor(L)} or fewer bookings`, 1 - o); }
+  return { mk, lh, la, grid, cMu, kMu };
+}
+
+const mkLine = (x) => `<b>${esc(x.code)}</b> ${esc(x.desc)} — <b>${pct(x.p)}%</b> · fair ${fair(x.p)}` + (x.push != null && x.push >= 0.05 ? ` · stake back ${pct(x.push)}%` : '');
+
+// Daily board: for each of today's matches the best pick in each group of the category (inside its probability band)
+async function renderMarketBoard(u, cat) {
+  const C = MK_CATS[cat];
+  const rows = [];
+  for (const { m, st } of byLeague(await analysedToday(), u)) {
+    const b = buildMarkets(m, st);
+    if (!b) continue;
+    const lines = [];
+    for (const g of C.groups) {
+      const [lo, hi] = GROUP_BAND[g] || [MK_MIN_P, MK_MAX_P];
+      const best = b.mk.filter((x) => x.cat === cat && x.group === g && x.p >= lo && x.p <= hi).sort((a, c) => c.p - a.p)[0];
+      if (best) lines.push({ g, x: best });
+    }
+    if (lines.length) rows.push({ m, st, b, lines, score: Math.max(...lines.map((l) => l.x.p / (GROUP_BAND[l.g] ? GROUP_BAND[l.g][0] : 1))) });
+  }
+  rows.sort((a, c) => c.score - a.score);
+  if (!rows.length) return `${C.icon} <b>${C.title}</b>\n\nNothing clears the probability bar today.\n\n` + t(u, 'disc');
+  let tx = `${C.icon} <b>${C.title}</b>\n<i>${C.sub}. Chances come from the goal model tuned to the blended 1X2. Fair odds = 1 ÷ chance — only bet if your bookie pays MORE. Tap a match below for every market.</i>\n\n`;
+  const shown = rows.slice(0, 8);
+  shown.forEach(({ m, b, lines }, i) => {
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    for (const { g, x } of lines) tx += `   ▸ <i>${GROUP_TITLE[g]}</i> · ${mkLine(x)}\n`;
+    tx += `   ⚽ Expected goals ${b.lh.toFixed(1)}–${b.la.toFixed(1)}\n\n`;
+  });
+  const nums = shown.map((r, i) => Markup.button.callback(`${i + 1} 📋`, `am:${r.m.id}`));
+  const kbRows = [];
+  for (let i = 0; i < nums.length; i += 4) kbRows.push(nums.slice(i, i + 4));
+  const others = Object.keys(MK_CATS).filter((c) => c !== cat).map((c) => Markup.button.callback(`${MK_CATS[c].icon} ${MK_CATS[c].short}`, `mk:${c}`));
+  for (let i = 0; i < others.length; i += 2) kbRows.push(others.slice(i, i + 2));
+  return { text: tx + t(u, 'disc'), kb: Markup.inlineKeyboard(kbRows) };
+}
+
+// Every market for ONE match
+async function renderAllMarkets(m, u) {
+  const st = bestKnown(m, await deepAnalysis(m));
+  const b = buildMarkets(m, st);
+  let tx = `📋 <b>All markets</b>\n<b>${esc(m.home)} vs ${esc(m.away)}</b>\n🏆 ${esc(m.compName)} · 🕒 ${fmtDate(m.utc)} ${fmtTime(m.utc)}\n`;
+  if (!b) return { text: tx + '\nNot enough data to price this match.\n\n' + t(u, 'disc'), kb: null };
+  const g = (grp, cat) => b.mk.filter((x) => x.group === grp && (!cat || x.cat === cat));
+  const row = (arr, f = (x) => `${x.code} ${pct(x.p)}%`) => arr.map(f).join(' · ');
+  tx += `⚽ Expected goals ${b.lh.toFixed(1)}–${b.la.toFixed(1)}\n<i>Fair odds = 100 ÷ chance (50% → 2.00). Bet only if the bookie pays more.</i>\n`;
+  tx += `\n🏁 <b>Result</b>\n1X2: ${row(g('x12'))}\nDouble chance: ${row(g('dc'))}\nDraw no bet: ${row(g('dnb'), (x) => `${x.code} ${pct(x.p)}%`)} <i>(stake back on a draw ${pct(g('dnb')[0].push)}%)</i>\n`;
+  tx += `\n⚽ <b>Goals</b>\nBTTS: ${row(g('bts'))}\n`;
+  for (const L of [0.5, 1.5, 2.5, 3.5]) { const o = b.mk.find((x) => x.code === `OV ${L}`), un = b.mk.find((x) => x.code === `UN ${L}`); tx += `${L}: Over ${pct(o.p)}% (fair ${fair(o.p)}) · Under ${pct(un.p)}% (fair ${fair(un.p)})\n`; }
+  tx += `Team goals: ${row(g('team'), (x) => `${x.code.replace('Home', esc(m.home)).replace('Away', esc(m.away))} ${pct(x.p)}%`)}\nMulti-goals: ${row(g('multi'))}\n`;
+  tx += `\n⏱ <b>Half-time / Full-time</b>\n${row(g('htft').slice(0, 3))}\n${row(g('htft').slice(3, 6))}\n${row(g('htft').slice(6, 9))}\n`;
+  tx += `First half: ${row(g('half').slice(0, 3), (x) => `${x.code.replace('HT ', '')} ${pct(x.p)}%`)}\nSecond half: ${row(g('half').slice(3), (x) => `${x.code.replace('2HT ', '')} ${pct(x.p)}%`)}\n`;
+  tx += `Win either half: ${row(g('weh'))}\nScore both halves: ${row(g('sbh'), (x) => `${x.code.replace('SBH ', '')} ${pct(x.p)}%`)}\n`;
+  const pick = (codes) => codes.map((c) => b.mk.find((x) => x.code === c)).filter(Boolean);
+  tx += `\n🧩 <b>Combos</b>\n` + pick(['1 & GG', '2 & GG', 'X & GG', '1 & OV 2.5', '2 & OV 2.5', '1X & UN 3.5', 'X2 & UN 3.5']).map((x) => `${x.code} ${pct(x.p)}% (fair ${fair(x.p)})`).join('\n') + '\n';
+  tx += `\n📐 <b>Handicaps</b>\n${row(g('eu'), (x) => `${x.code} ${pct(x.p)}%`)}\n`;
+  const ah = g('ah');
+  for (const side of ['Home', 'Away']) {
+    tx += `AH ${side === 'Home' ? esc(m.home) : esc(m.away)}: ` + ah.filter((x) => x.code.startsWith(`AH ${side} `)).filter((x) => ['-1.5', '-1', '-0.5', '+0.5', '+1', '+1.5'].includes(x.code.split(' ')[2])).map((x) => `${x.code.split(' ')[2]} ${pct(x.win)}%${x.push >= 0.05 ? ' (push ' + pct(x.push) + '%)' : ''}`).join(' · ') + '\n';
+  }
+  tx += `<i>AH shows the chance the bet fully wins; on whole lines a push returns your stake. Quarter lines (±0.25 / ±0.75) are on the Handicaps board.</i>\n`;
+  tx += `\n🟨 <b>Corners &amp; cards</b> <i>(rough — league averages, no live corner/card feed)</i>\nCorners (≈${b.cMu.toFixed(1)}): ` + [8.5, 9.5, 10.5, 11.5].map((L) => `OV ${L} ${pct(b.mk.find((x) => x.code === `Corners OV ${L}`).p)}%`).join(' · ') + '\n';
+  tx += `Cards (≈${b.kMu.toFixed(1)}): ` + [2.5, 3.5, 4.5, 5.5].map((L) => `OV ${L} ${pct(b.mk.find((x) => x.code === `Cards OV ${L}`).p)}%`).join(' · ') + '\n';
+  tx += '\n' + t(u, 'disc');
+  const kb = Markup.inlineKeyboard([[Markup.button.callback('🔮 Full prediction', `m:${m.id}:0`), Markup.button.callback('📈 Markets hub', 'hub:markets')]]);
+  return { text: tx, kb };
 }
 
 // ----- Live scores -----
@@ -2691,8 +2909,15 @@ function hubView(name, u) {
   }
   if (name === 'markets') {
     return {
-      text: '📈 <b>Markets</b>\n━━━━━━━━━━━━━━\n📈 <b>Value bets</b> — model beats the best bookie price\n⚽ <b>Goals</b> — over/under 2.5 and BTTS\n🛡 <b>Double chance</b> — safer 1X / X2 / DNB\n🎯 <b>Correct score</b> — likeliest scorelines' + free,
-      kb: Markup.inlineKeyboard([[LBTN(u, '📈 Value bets', 'value'), LBTN(u, '⚽ Goals', 'goals')], [LBTN(u, '🛡 Double chance', 'dc'), LBTN(u, '🎯 Correct score', 'scores')], back]),
+      text: '📈 <b>Markets</b>\n━━━━━━━━━━━━━━\n📈 <b>Value bets</b> — model beats the best bookie price\n🏁 <b>Result</b> — 1X2, Double Chance, Draw No Bet\n⚽ <b>Goals</b> — GG/NG, Over/Under 0.5–3.5, team goals, multi-goals\n⏱ <b>HT/FT</b> — HT/FT, HT, 2HT, win either half, score both halves\n🧩 <b>Combos</b> — 1 &amp; GG, 1 &amp; OV 2.5, 1X &amp; UN 3.5…\n📐 <b>Handicaps</b> — 1 (-1), 2 (+1), Asian handicap\n🛡 <b>Double chance</b> — safer 1X / X2 / DNB picks\n🎯 <b>Correct score</b> — likeliest scorelines\n📋 <b>Any match</b> — every market for one game (also corners &amp; cards)' + free,
+      kb: Markup.inlineKeyboard([
+        [LBTN(u, '📈 Value bets', 'value'), LBTN(u, '🏁 Result', 'mk:res')],
+        [LBTN(u, '⚽ Goals', 'mk:goals'), LBTN(u, '⏱ HT/FT', 'mk:htft')],
+        [LBTN(u, '🧩 Combos', 'mk:combo'), LBTN(u, '📐 Handicaps', 'mk:hcp')],
+        [LBTN(u, '🛡 Double chance', 'dc'), LBTN(u, '🎯 Correct score', 'scores')],
+        [LBTN(u, '📋 Any match', 'mkhelp'), LBTN(u, '⚽ O/U 2.5 &amp; BTTS', 'goals')],
+        back,
+      ]),
     };
   }
   if (name === 'acca') {
@@ -3445,6 +3670,36 @@ for (const [name, [label, fn]] of Object.entries(PREM_TOOLS)) {
   });
 }
 
+// ----- full market boards + per-match "all markets" -----
+const mkBoardH = (cat) => toolHandler((ctx) => renderMarketBoard(ctx.u, cat));
+bot.action(/^mk:(res|goals|htft|combo|hcp)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const cat = ctx.match[1];
+  if (!ctx.premium) return paywall(ctx, `🔒 <b>${MK_CATS[cat].title}</b> is a Premium feature.`);
+  mkBoardH(cat)(ctx).catch(console.error);
+});
+for (const [cmd, cat] of [['result', 'res'], ['htft', 'htft'], ['combos', 'combo'], ['handicaps', 'hcp']]) bot.command(cmd, needPremium(detach(mkBoardH(cat))));
+const allMarketsFor = (m) => toolHandler((ctx) => renderAllMarkets(m, ctx.u));
+bot.action(/^am:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.premium) return paywall(ctx, '🔒 <b>All markets</b> is a Premium feature.');
+  const m = await findMatchAny(Number(ctx.match[1]));
+  if (!m) return void (await reply(ctx, 'Match not found (list refreshed). Use /today again.'));
+  allMarketsFor(m)(ctx).catch(console.error);
+});
+bot.command('market', needPremium(detach(async (ctx) => {
+  const query = argText(ctx);
+  if (!query) return void (await reply(ctx, 'Usage: <code>/market Arsenal Chelsea</code> or <code>/market Real Madrid</code> — every market (1X2, GG, Over/Under, HT/FT, combos, handicaps, corners &amp; cards) for the next match.'));
+  const m = await findFixture(query);
+  if (!m) return void (await reply(ctx, `🔎 No fixture found for “${esc(query)}” in the next 7 days. Try the team name as it appears in /today.`));
+  await allMarketsFor(m)(ctx);
+})));
+bot.action('mkhelp', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.premium) return paywall(ctx, '🔒 <b>All markets</b> is a Premium feature.');
+  await editOrReply(ctx, '📋 <b>Every market for one match</b>\n\n• Open <b>⚽ Today</b>, tap a match, then <b>📋 All markets</b>\n• Or type <code>/market Arsenal Chelsea</code> (or just one team name)\n• On any market board, tap the numbered 📋 buttons', navKb([[Markup.button.callback('⚽ Today', 'today')]]));
+});
+
 // ----- follow a pick / personal record / leaderboard -----
 bot.action(/^fp:(\d+)$/, async (ctx) => {
   const id = Number(ctx.match[1]);
@@ -3600,6 +3855,11 @@ const PUBLIC_COMMANDS = [
   { command: 'goals', description: 'Goals markets (Premium)' },
   { command: 'dc', description: 'Safer markets: DC / DNB (Premium)' },
   { command: 'scores', description: 'Correct-score suggestions (Premium)' },
+  { command: 'result', description: '1X2, Double Chance, DNB board (Premium)' },
+  { command: 'htft', description: 'HT/FT, win either half, score both halves (Premium)' },
+  { command: 'combos', description: 'Combo markets: 1 & GG, 1 & OV 2.5… (Premium)' },
+  { command: 'handicaps', description: 'Handicaps and Asian handicap (Premium)' },
+  { command: 'market', description: 'Every market for one match (Premium)' },
   { command: 'acca', description: 'Accumulator builder (Premium)' },
   { command: 'safe', description: 'Safe 2-odds slip (Premium)' },
   { command: 'weekend', description: 'Weekend special acca (Premium)' },
