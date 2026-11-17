@@ -3717,6 +3717,20 @@ bot.action('best10', async (ctx) => { await ctx.answerCbQuery(); picksHandler('b
 bot.command('best1', detach(picksHandler('best1')));
 bot.action('best1', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best1')(ctx).catch(console.error); });
 
+// premium-only analysis tools
+const toolHandler = (render, again) => async (ctx) => {
+  const wait = await ctx.reply(t(ctx.u, 'wait_generic'));
+  try {
+    await ctx.sendChatAction('typing');
+    const r = await render(ctx);
+    await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
+    if (typeof r === 'string') await replyLong(ctx, r, navKb(again ? [[Markup.button.callback('🔄 Refresh', again)]] : [])); else await replyLong(ctx, r.text, r.kb ? withNav(r.kb) : navKb());
+  } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
+};
+const valueH = toolHandler((ctx) => renderValue(ctx.u), 'value');
+const goalsH = toolHandler((ctx) => renderGoals(ctx.u));
+const dcH = toolHandler((ctx) => renderDC(ctx.u));
+
 // ----- Smart picks: /smart10 (free) · /smart5 · /smart3 (Premium) -----
 const smartRun = (kind) => toolHandler((ctx) => renderSmart(ctx.u, kind));
 for (const kind of Object.keys(SMART)) {
@@ -3745,21 +3759,6 @@ bot.action(/^fc:(\d+)$/, async (ctx) => { // follow a Smart pick (settled on its
     [ctx.u.id, id, r.home, r.away, r.utc, r.cpick, r.clabel, r.codds]);
   return ctx.answerCbQuery(ins.rows.length ? '📌 Following — I\'ll message you the result.' : 'You already follow a pick for this match.', { show_alert: !ins.rows.length });
 });
-
-
-// premium-only analysis tools
-const toolHandler = (render, again) => async (ctx) => {
-  const wait = await ctx.reply(t(ctx.u, 'wait_generic'));
-  try {
-    await ctx.sendChatAction('typing');
-    const r = await render(ctx);
-    await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
-    if (typeof r === 'string') await replyLong(ctx, r, navKb(again ? [[Markup.button.callback('🔄 Refresh', again)]] : [])); else await replyLong(ctx, r.text, r.kb ? withNav(r.kb) : navKb());
-  } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
-};
-const valueH = toolHandler((ctx) => renderValue(ctx.u), 'value');
-const goalsH = toolHandler((ctx) => renderGoals(ctx.u));
-const dcH = toolHandler((ctx) => renderDC(ctx.u));
 const accaFromText = (ctx) => {
   const a = argText(ctx).toLowerCase().split(/\s+/);
   const mode = ['safe', 'balanced', 'risky'].find((x) => a.includes(x)) || 'balanced';
