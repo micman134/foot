@@ -92,11 +92,10 @@ const AI_CONCURRENCY = Number(process.env.AI_CONCURRENCY || PRESET.conc);
 const TZ = process.env.TIMEZONE || 'Africa/Lagos';
 const CACHE_MS = Number(process.env.CACHE_MINUTES || 180) * 60 * 1000;
 const SEASON_CACHE_MS = 6 * 60 * 60 * 1000;
-const COMBO_ON = process.env.COMBO_PICKS !== 'off';                      // pick the MOST LIKELY market per match: 1, 2, 1X, X2, GG, NG (set COMBO_PICKS=off for old 1X2-only picks)
-const COMBO_DC = process.env.COMBO_DC !== 'off';                         // allow double chance 1X / X2
-const COMBO_GOALS = process.env.COMBO_GOALS !== 'off';                   // allow GG / NG (both teams to score / not)
-const COMBO_MIN_ODDS = Number(process.env.COMBO_MIN_ODDS || 1.15);       // minimum FAIR odds for a combo pick (raise to 1.25+ to skip very short prices)
-const COMBO_MARGIN = Number(process.env.COMBO_MARGIN || 0.06);           // bookmaker margin assumed when a followed combo pick is scored (fair odds are better than real prices)
+const COMBO_DC = process.env.COMBO_DC !== 'off';                         // /smart picks: allow double chance 1X / X2 / 12
+const COMBO_GOALS = process.env.COMBO_GOALS !== 'off';                   // /smart picks: allow GG / NG
+const COMBO_MIN_ODDS = Number(process.env.COMBO_MIN_ODDS || 1.15);       // minimum FAIR odds for a 1X / X2 / 12 / GG / NG pick (raise to 1.25+ to skip very short prices)
+const COMBO_MARGIN = Number(process.env.COMBO_MARGIN || 0.06);           // bookmaker margin assumed when a followed smart pick is scored
 const MIN_PICK_ODDS = Number(process.env.MIN_PICK_ODDS || 1.15); // skip "pointless" 1.05 favourites in Top 5
 const MAX_AI_MATCHES = Number(process.env.MAX_AI_MATCHES || 40); // how many top candidates get an LLM opinion
 // ----- Model tuning -----
@@ -1205,52 +1204,6 @@ function topPick(m, final) {
   return { k, p: v, label, sign, odds };
 }
 
-// ---- Market chooser: for each match compare 1, 2, 1X, X2, GG, NG and keep the one with the highest probability ----
-// 1 / 2 use the real bookmaker price. 1X / X2 use the fair price implied by the de-vigged market. GG / NG have no bookmaker feed, so they use model fair odds (1 / p).
-const mktP = (k, o) => (k === 'H' ? o.H : k === 'A' ? o.A : k === 'D' ? o.D : k === '1X' ? o.H + o.D : k === 'X2' ? o.D + o.A : k === '12' ? o.H + o.A : null);
-function marketPick(m, st) {
-  const f = st.final;
-  if (!f || !m.odds) return null;
-  const mp = m.odds.probs;
-  const c = [];
-  const add = (k, sign, label, p, odds, fair) => {
-    if (p > 0 && odds && Number.isFinite(odds) && odds >= (fair ? COMBO_MIN_ODDS : MIN_PICK_ODDS)) c.push({ k, sign, label, p, odds, fair });
-  };
-  add('H', '1', `${m.home} win`, f.H, m.odds.odds.H, false);
-  add('A', '2', `${m.away} win`, f.A, m.odds.odds.A, false);
-  if (COMBO_DC) {
-    add('1X', '1X', `${m.home} or Draw`, f.H + f.D, 1 / (mp.H + mp.D), true);
-    add('X2', 'X2', `${m.away} or Draw`, f.D + f.A, 1 / (mp.D + mp.A), true);
-    add('12', '12', `${m.home} or ${m.away} (no draw)`, f.H + f.A, 1 / (mp.H + mp.A), true);
-  }
-  if (COMBO_GOALS && st.mk && st.form) {
-    add('GG', 'GG', 'Both teams to score', st.mk.btts, 1 / st.mk.btts, true);
-    add('NG', 'NG', 'Both teams NOT to score', 1 - st.mk.btts, 1 / (1 - st.mk.btts), true);
-  }
-  return c.length ? c.sort((a, b) => b.p - a.p)[0] : null;
-}
-// Did a pick win? k = H/D/A/1X/X2/GG/NG, r = settled prediction record (res + score). null = cannot tell yet.
-function pickWon(k, r) {
-  if (k === 'H' || k === 'D' || k === 'A') return k === r.res;
-  if (k === '1X') return r.res === 'H' || r.res === 'D';
-  if (k === 'X2') return r.res === 'A' || r.res === 'D';
-  if (k === '12') return r.res === 'H' || r.res === 'A';
-  if (k === 'GG' || k === 'NG') {
-    const mt = /^(\d+)-(\d+)$/.exec(r.score || '');
-    if (!mt) return null;
-    const both = Number(mt[1]) > 0 && Number(mt[2]) > 0;
-    return k === 'GG' ? both : !both;
-  }
-  return null;
-}
-const oddsTxt = (p) => (p.fair ? `fair ${p.odds.toFixed(2)}` : `${oddsTxt(p)}`);
-const bestPx = (m, p) => (m.odds && m.odds.best && m.odds.best[p.k]) || p.odds;
-function srcLine(m, st, p, formWord = 'Form') {
-  if (p.k === 'GG' || p.k === 'NG') return `   📊 Goal-model chance ${pct(p.p)}% · no bookmaker price for this market, so the odds shown are fair odds\n`;
-  const v = (src) => pct(mktP(p.k, src));
-  return `   📊 Market ${v(m.odds.probs)}%` + (st.form ? ` · ${formWord} ${v(st.form)}%` : '') + (st.ai ? ` · AI ${v(st.ai.probs)}%` : '') + '\n';
-}
-
 function reasonOf(m, st) {
   if (st.ai && st.ai.reason) return st.ai.reason;
   if (st.form) return `Goal model expects ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)}; blended with market odds.`;
@@ -1415,22 +1368,16 @@ function whyPopular(short, full, prof, tableOk) {
 
 // Confidence + agreement between odds / form model / AI + small "value" edge vs the market - fatigue
 function pickScore(m, st, minConf = 0) {
-  const pick = COMBO_ON ? marketPick(m, st) : topPick(m, st.final);
-  const floor = pick && pick.fair ? COMBO_MIN_ODDS : MIN_PICK_ODDS;
-  if (!pick || !m.odds || !pick.odds || pick.odds < floor || pick.p < minConf) return null;
-  const goals = pick.k === 'GG' || pick.k === 'NG';
-  const single = pick.k === 'H' || pick.k === 'A' || pick.k === 'D';
-  // a source "supports" the pick when it leans the same way (1/2: same favourite; 1X/X2: 60%+; GG/NG: 50%+ from the goal model)
-  const supports = (src) => (goals ? (pick.k === 'GG' ? src.btts : 1 - src.btts) >= 0.5 : single ? argmax(src) === pick.k : mktP(pick.k, src) >= 0.6);
-  const srcs = goals ? [st.mk] : [m.odds.probs, st.form, st.ai && st.ai.probs].filter(Boolean);
-  const agreeN = srcs.filter(supports).length;
+  const pick = topPick(m, st.final);
+  if (!pick || !m.odds || !pick.odds || pick.odds < MIN_PICK_ODDS || pick.p < minConf) return null;
+  const srcs = [m.odds.probs, st.form, st.ai && st.ai.probs].filter(Boolean);
+  const agreeN = srcs.filter((x) => argmax(x) === pick.k).length;
   const agree = agreeN / srcs.length;
-  const ref = goals ? pick.p : mktP(pick.k, m.odds.probs);
-  const edge = Math.max(-0.04, Math.min(0.04, pick.p - ref));
-  const side = pick.k === 'H' || pick.k === '1X' ? st.hp : pick.k === 'A' || pick.k === 'X2' ? st.ap : null;
+  const edge = Math.max(-0.04, Math.min(0.04, pick.p - m.odds.probs[pick.k]));
+  const side = pick.k === 'H' ? st.hp : pick.k === 'A' ? st.ap : null;
   const tired = side && side.restDays != null && side.restDays < 3 ? 0.02 : 0;
   // penalties: model leans a different way than the pick, or model and market are far apart (usually = missing info like injuries)
-  const split = goals ? 0 : (st.form && !supports(st.form) ? 0.05 : 0) + (st.ai && !supports(st.ai.probs) ? 0.02 : 0);
+  const split = (st.form && argmax(st.form) !== pick.k ? 0.05 : 0) + (st.ai && argmax(st.ai.probs) !== pick.k ? 0.02 : 0);
   const dis = st.disagree != null ? DISAGREE_PENALTY * Math.max(0, st.disagree - 0.05) : 0;
   return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis };
 }
@@ -1482,6 +1429,135 @@ async function computeBest3() {
     throw e;
   }
 }
+
+// ---------- SMART picks (/smart10 · /smart5 · /smart3): most likely market per match ----------
+// Separate from Top 5 / Best 3 / Best 10, which are untouched. For each match we compare 1, 2, 1X, X2, 12, GG and NG and keep the most likely one.
+// 1 / 2 use the real bookmaker price. 1X / X2 / 12 use the fair price from the de-vigged market. GG / NG have no bookmaker feed, so they use model fair odds (1 / p).
+const mktP = (k, o) => (k === 'H' ? o.H : k === 'A' ? o.A : k === 'D' ? o.D : k === '1X' ? o.H + o.D : k === 'X2' ? o.D + o.A : k === '12' ? o.H + o.A : null);
+function marketPick(m, st) {
+  const f = st.final;
+  if (!f || !m.odds) return null;
+  const mp = m.odds.probs;
+  const c = [];
+  const add = (k, sign, label, p, odds, fair) => {
+    if (p > 0 && odds && Number.isFinite(odds) && odds >= (fair ? COMBO_MIN_ODDS : MIN_PICK_ODDS)) c.push({ k, sign, label, p, odds, fair });
+  };
+  add('H', '1', `${m.home} win`, f.H, m.odds.odds.H, false);
+  add('A', '2', `${m.away} win`, f.A, m.odds.odds.A, false);
+  if (COMBO_DC) {
+    add('1X', '1X', `${m.home} or Draw`, f.H + f.D, 1 / (mp.H + mp.D), true);
+    add('X2', 'X2', `${m.away} or Draw`, f.D + f.A, 1 / (mp.D + mp.A), true);
+    add('12', '12', `${m.home} or ${m.away} (no draw)`, f.H + f.A, 1 / (mp.H + mp.A), true);
+  }
+  if (COMBO_GOALS && st.mk && st.form) {
+    add('GG', 'GG', 'Both teams to score', st.mk.btts, 1 / st.mk.btts, true);
+    add('NG', 'NG', 'Both teams NOT to score', 1 - st.mk.btts, 1 / (1 - st.mk.btts), true);
+  }
+  return c.length ? c.sort((a, b) => b.p - a.p)[0] : null;
+}
+// Did a pick win? k = H/D/A/1X/X2/12/GG/NG, r = settled record (res + score). null = cannot tell yet.
+function pickWon(k, r) {
+  if (k === 'H' || k === 'D' || k === 'A') return k === r.res;
+  if (k === '1X') return r.res === 'H' || r.res === 'D';
+  if (k === 'X2') return r.res === 'A' || r.res === 'D';
+  if (k === '12') return r.res === 'H' || r.res === 'A';
+  if (k === 'GG' || k === 'NG') {
+    const mt = /^(\d+)-(\d+)$/.exec(r.score || '');
+    if (!mt) return null;
+    const both = Number(mt[1]) > 0 && Number(mt[2]) > 0;
+    return k === 'GG' ? both : !both;
+  }
+  return null;
+}
+const oddsTxt = (p) => (p.fair ? `fair ${p.odds.toFixed(2)}` : `@ ${p.odds.toFixed(2)}`);
+const bestPx = (m, p) => (m.odds && m.odds.best && m.odds.best[p.k]) || p.odds;
+function srcLine(m, st, p) {
+  if (p.k === 'GG' || p.k === 'NG') return `   📊 Goal-model chance ${pct(p.p)}% · no bookmaker price for this market, so the odds shown are fair odds\n`;
+  const v = (src) => pct(mktP(p.k, src));
+  return `   📊 Market ${v(m.odds.probs)}%` + (st.form ? ` · Form ${v(st.form)}%` : '') + (st.ai ? ` · AI ${v(st.ai.probs)}%` : '') + '\n';
+}
+
+// Same scoring idea as pickScore, but for the market chosen by marketPick
+function comboScore(m, st, minConf = 0) {
+  const pick = marketPick(m, st);
+  if (!pick || !m.odds || !pick.odds || pick.p < minConf) return null;
+  const goals = pick.k === 'GG' || pick.k === 'NG';
+  const single = pick.k === 'H' || pick.k === 'A';
+  // a source "supports" the pick when it leans the same way (1/2: same favourite; 1X/X2/12: 60%+; GG/NG: 50%+ from the goal model)
+  const supports = (src) => (goals ? (pick.k === 'GG' ? src.btts : 1 - src.btts) >= 0.5 : single ? argmax(src) === pick.k : mktP(pick.k, src) >= 0.6);
+  const srcs = goals ? [st.mk] : [m.odds.probs, st.form, st.ai && st.ai.probs].filter(Boolean);
+  const agreeN = srcs.filter(supports).length;
+  const agree = agreeN / srcs.length;
+  const ref = goals ? pick.p : mktP(pick.k, m.odds.probs);
+  const edge = Math.max(-0.04, Math.min(0.04, pick.p - ref));
+  const side = pick.k === 'H' || pick.k === '1X' ? st.hp : pick.k === 'A' || pick.k === 'X2' ? st.ap : null;
+  const tired = side && side.restDays != null && side.restDays < 3 ? 0.02 : 0;
+  const split = goals ? 0 : (st.form && !supports(st.form) ? 0.05 : 0) + (st.ai && !supports(st.ai.probs) ? 0.02 : 0);
+  const dis = st.disagree != null ? DISAGREE_PENALTY * Math.max(0, st.disagree - 0.05) : 0;
+  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis };
+}
+
+async function dayCached(key, raw, okFn) {
+  const k = key + ':' + localDate(new Date());
+  const c = cache.get(k);
+  if (c && c.exp > Date.now()) return c.val;
+  if (c && c.pending) return c.pending;
+  const pending = raw();
+  cache.set(k, { pending, exp: 0 });
+  try {
+    const val = await pending;
+    cache.set(k, { val, exp: Date.now() + (okFn(val) ? CACHE_MS : 10 * 60e3) });
+    return val;
+  } catch (e) {
+    cache.delete(k);
+    throw e;
+  }
+}
+
+// Smart 10 / Smart 5: the 10 best picks of the day across all matches (Smart 5 = the first 5 of them)
+async function computeSmartRaw() {
+  const now = Date.now();
+  const matches = (await getMatchesToday()).filter((m) => m.odds && m.utc > now);
+  const withStats = [];
+  for (const m of matches) withStats.push({ m, st: await deepAnalysis(m) });
+  const rank = (arr) => arr.map((x) => ({ ...x, sc: comboScore(x.m, x.st) })).filter((x) => x.sc).sort((a, b) => b.sc.score - a.sc.score);
+  const cands = rank(withStats).slice(0, MAX_AI_MATCHES);
+  const refined = await pool(cands, AI_CONCURRENCY, async (x) => ({ m: x.m, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
+  withStats.forEach((x) => logPrediction(x.m, x.st));
+  refined.forEach((x) => logPrediction(x.m, x.st));
+  const top = rank(refined).slice(0, 10);
+  top.forEach((x, i) => logComboPick(x.m, x.st, i < 5 ? 'smart5' : 'smart10'));
+  return top;
+}
+const computeSmart = () => dayCached('smart', computeSmartRaw, (v) => !AI_ON || v.some((x) => x.st.ai));
+
+// Smart 3: under-the-radar version (same rule as Best 3: no top-table teams, no big-name clubs)
+async function computeSmart3Raw() {
+  const now = Date.now();
+  const matches = (await getMatchesToday()).filter((m) => m.odds && m.utc > now);
+  const pool0 = [];
+  let skipped = 0;
+  for (const m of matches) {
+    const d = await deepAnalysis(m);
+    const big = whyPopular(m.home, m.homeFull, d.hp, d.table) || whyPopular(m.away, m.awayFull, d.ap, d.table);
+    if (big) { skipped++; continue; }
+    pool0.push({ m, st: d, thin: Math.max(d.hp.n, d.hs.games || 0) < MIN_BEST3_GAMES || Math.max(d.ap.n, d.as.games || 0) < MIN_BEST3_GAMES });
+  }
+  const rank = (arr) =>
+    arr.map((x) => {
+      const sc = comboScore(x.m, x.st, 0);
+      if (!sc) return null;
+      return { ...x, sc, tier: sc.pick.p < BEST3_MIN_CONF ? 2 : x.thin ? 1 : 0 };
+    }).filter(Boolean).sort((a, b) => a.tier - b.tier || b.sc.score - a.sc.score);
+  const cands = rank(pool0).slice(0, MAX_AI_MATCHES);
+  const refined = await pool(cands, AI_CONCURRENCY, async (x) => ({ m: x.m, thin: x.thin, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
+  pool0.forEach((x) => logPrediction(x.m, x.st));
+  refined.forEach((x) => logPrediction(x.m, x.st));
+  const list = rank(refined).slice(0, 3);
+  list.forEach((x) => logComboPick(x.m, x.st, 'smart3'));
+  return { list, skipped, considered: matches.length };
+}
+const computeSmart3 = () => dayCached('smart3', computeSmart3Raw, (v) => !AI_ON || v.list.some((x) => x.st.ai));
 
 // ---------- Prediction log + self-evaluation (/stats) ----------
 // Every analysed match is stored before kickoff; results are matched later to score each source (Brier / log-loss / accuracy).
@@ -1546,11 +1622,19 @@ function logPrediction(m, st, tag) {
   if (tag && !r.tags.includes(tag)) {
     r.tags.push(tag);
     if (!r.pubPick) { r.pubPick = argmax(st.final); r.pubOdds = hda(m.odds.odds); } // odds + side at the moment we first published it
-    if (!r.cpick && COMBO_ON) { // the market we actually published (1/2/1X/X2/GG/NG) so followed picks can be settled correctly
-      const cp = marketPick(m, st);
-      if (cp) { r.cpick = cp.k; r.clabel = cp.label; r.cp = cp.p; r.cfair = !!cp.fair; r.codds = cp.fair ? Math.max(1.01, +(cp.odds * (1 - COMBO_MARGIN)).toFixed(2)) : cp.odds; }
-    }
   }
+  predDirty.add(r.id);
+  savePredLog();
+}
+
+function logComboPick(m, st, tag) {
+  logPrediction(m, st, tag);
+  const r = predById.get(m.id);
+  if (!r || r.res || r.cpick) return;
+  const cp = marketPick(m, st);
+  if (!cp) return;
+  r.cpick = cp.k; r.clabel = cp.label; r.cp = cp.p; r.cfair = !!cp.fair;
+  r.codds = cp.fair ? Math.max(1.01, +(cp.odds * (1 - COMBO_MARGIN)).toFixed(2)) : cp.odds; // fair prices are better than real ones, so followed picks are scored after a margin
   predDirty.add(r.id);
   savePredLog();
 }
@@ -1609,7 +1693,7 @@ function tuneWeights(rows) {
 function roiOf(rows) {
   let n = 0, hit = 0, profit = 0;
   for (const r of rows) {
-    if (!r.odds || !r.final || !r.res || r.cfair) continue; // fair-priced picks (1X / X2 / 12 / GG / NG) have no real bookmaker price, so they are left out of ROI
+    if (!r.odds || !r.final || !r.res) continue;
     const k = argmax(r.final);
     n++;
     if (k === r.res) { hit++; profit += r.odds[k] - 1; } else profit -= 1;
@@ -1839,7 +1923,7 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
-  "/menu – main menu\n/best10 – 10 free picks · /picks – all pick lists\n/top5 · /best3 · /best1 – top picks (Premium)\n/best10pro · /potw – Pro list &amp; pick of the week (Premium)\n" +
+  "/menu – main menu\n/best10 – 10 free picks · /picks – all pick lists\n/top5 · /best3 · /best1 – top picks (Premium)\n/best10pro · /potw – Pro list &amp; pick of the week (Premium)\n/smart10 · /smart5 · /smart3 – smart picks: 1 · 2 · 1X · X2 · 12 · GG · NG\n" +
   '/today · /live · /table · /predict\n/value · /goals · /dc · /scores – markets (Premium)\n/result · /htft · /combos · /handicaps · /market – full market boards (Premium)\n/acca · /safe · /weekend – accumulators (Premium)\n' +
   '/myrecord · /leaders – track your picks\n/watchlist · /subscribe · /stake\n/premium · /redeem · /refer · /account · /settings · /lang\n' +
   '/stats · /history · /calibration – model track record\n/responsible – stay in control · /help';
@@ -2290,14 +2374,14 @@ async function renderTop5(u, { full = true } = {}) {
   const top = applyPrefs(all, u);
   if (!top.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null, empty: true };
   const shown = full ? top : top.slice(0, FREE_PICKS);
-  let tx = `🏆 <b>${t(u, 'top5_head')}</b>\n<i>${t(u, 'top5_sub')}</i>\n\n${MARKET_HINT}${FOLLOW_HINT}`;
+  let tx = `🏆 <b>${t(u, 'top5_head')}</b>\n<i>${t(u, 'top5_sub')}</i>\n\n${FOLLOW_HINT}`;
   shown.forEach(({ m, st, sc }, i) => {
     const p = sc.pick;
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
-    tx += stakeTxt(u, p.p, bestPx(m, p)) + '\n';
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
   });
   let kb = null;
   if (shown.length < top.length) { tx += `🔒 ${t(u, 'locked_more', top.length - shown.length)}\n\n`; kb = upgradeKb(u); }
@@ -2308,14 +2392,14 @@ async function renderBest10(u) {
   const all = (await computeBest10()).filter((x) => x.m.utc > Date.now());
   const list = applyPrefs(all, u);
   if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null, empty: true };
-  let tx = `🔟 <b>Best 10 picks today</b>\n<i>Free for everyone. Ranked by confidence, source agreement and value vs the market. The sharpest picks are in Premium (/top5 · /best3 · /best1).</i>\n\n${MARKET_HINT}${FOLLOW_HINT}`;
+  let tx = `🔟 <b>Best 10 picks today</b>\n<i>Free for everyone. Ranked by confidence, source agreement and value vs the market. The sharpest picks are in Premium (/top5 · /best3 · /best1).</i>\n\n${FOLLOW_HINT}`;
   list.forEach(({ m, st, sc }, i) => {
     const p = sc.pick;
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
-    tx += stakeTxt(u, p.p, bestPx(m, p)) + '\n';
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
   });
   return { text: tx + t(u, 'disc'), kb: followKb(list, u && hasPremium(u) ? null : quickBuyKb()), empty: false };
 }
@@ -2336,14 +2420,14 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
     if (list.length < 3) tx += `<i>Only ${list.length} match${list.length > 1 ? 'es' : ''} had usable odds today.</i>\n`;
     tx += '\n';
   }
-  tx += MARKET_HINT + FOLLOW_HINT;
+  tx += FOLLOW_HINT;
   const medal = ['🥇', '🥈', '🥉'];
   shown.forEach(({ m, st, sc, tier }, i) => {
     const p = sc.pick;
     const k = p.k;
     tx += `${medal[i] || i + 1 + '.'} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence · ${sc.agreeN}/${sc.total} sources agree\n`;
-    tx += srcLine(m, st, p, 'Form model');
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence · ${sc.agreeN}/${sc.total} sources agree\n`;
+    tx += `   📊 Market ${pct(m.odds.probs[k])}%` + (st.form ? ` · Form model ${pct(st.form[k])}%` : '') + (st.ai ? ` · AI ${pct(st.ai.probs[k])}%` : '') + '\n';
     const tl = (name, pr) =>
       `${esc(name)} #${pr.rank || '?'}` + (pr.venue.n ? ` (${f1(pr.venue.ppg)} pts/g ${pr === st.hp ? 'home' : 'away'}, ${f1(pr.venue.gf)}-${f1(pr.venue.ga)} goals/g)` : '');
     if (st.hp.rank || st.ap.rank || st.hp.venue.n || st.ap.venue.n) tx += `   📈 ${tl(m.home, st.hp)} | ${tl(m.away, st.ap)}\n`;
@@ -2352,7 +2436,7 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
     if (tier === 2) tx += `   ⚠️ <i>Lower-confidence pick: few safe options today.</i>\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
-    tx += stakeTxt(u, p.p, bestPx(m, p)) + '\n';
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
   });
   let kb = null;
   if (!only1 && shown.length < list.length) { tx += `🔒 ${t(u, 'locked_more', list.length - shown.length)}\n\n`; kb = upgradeKb(u); }
@@ -2360,6 +2444,43 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
 }
 
 // ----- Value bets: model probability vs the BEST bookmaker price -----
+// ----- Smart 10 / 5 / 3 -----
+const MARKET_HINT = '<i>🎯 For every match I compare 1 · 2 · 1X · X2 · 12 · GG · NG and show the most likely one. 1X, X2, 12, GG and NG show <b>fair odds</b> (no bookmaker feed) — only bet if your bookie pays at least that.</i>\n\n';
+const SMART = { smart10: ['🎯 Smart 10', false], smart5: ['🎯 Smart 5', true], smart3: ['🎯 Smart 3', true] };
+async function renderSmart(u, kind) {
+  const upcoming = (x) => x.m.utc > Date.now();
+  let list, all, note = '';
+  if (kind === 'smart3') {
+    const b = await computeSmart3();
+    all = b.list.filter(upcoming);
+    list = applyPrefs(all, u);
+    note = `<i>Under-the-radar matches only (no top-${TOP_RANK_EXCLUDE} table teams, no big-name clubs).</i>\n`;
+    if (!list.length)
+      return { text: all.length ? t(u, 'none_prefs') : `😴 No under-the-radar match with usable odds right now (${b.considered} with odds, ${b.skipped} skipped because a top/popular club plays). Odds for later kickoffs usually appear closer to match time, so try again later, or use /smart5.\n\n` + t(u, 'disc'), kb: null };
+  } else {
+    all = (await computeSmart()).filter(upcoming);
+    list = applyPrefs(all, u).slice(0, kind === 'smart5' ? 5 : 10);
+    if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null };
+  }
+  const head = { smart10: '🎯🔟 <b>Smart 10 — most likely market per match</b>', smart5: '🎯🏆 <b>Smart 5 — most likely market per match</b>', smart3: '🎯💎 <b>Smart 3 — most likely market per match</b>' }[kind];
+  let tx = `${head}\n${note}\n${MARKET_HINT}${FOLLOW_HINT}`;
+  list.forEach(({ m, st, sc }, i) => {
+    const p = sc.pick;
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence · ${sc.agreeN}/${sc.total} sources agree\n`;
+    tx += srcLine(m, st, p);
+    if (st.mk && st.form) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
+    const r = reasonOf(m, st);
+    if (r) tx += `   <i>${esc(r)}</i>\n`;
+    tx += stakeTxt(u, p.p, bestPx(m, p)) + '\n';
+  });
+  const rows = [];
+  const fb = list.map((x, i) => Markup.button.callback(`📌 ${i + 1}`, `fc:${x.m.id}`));
+  for (let i = 0; i < fb.length; i += 5) rows.push(fb.slice(i, i + 5));
+  rows.push(Object.keys(SMART).filter((x) => x !== kind).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(u) ? '🔒 ' : '') + SMART[x][0], x)));
+  return { text: tx + t(u, 'disc'), kb: Markup.inlineKeyboard(rows) };
+}
+
 function computeValue() {
   return cached('value:' + localDate(new Date()), CACHE_MS, async () => {
     await refineAll().catch(() => {});
@@ -2427,13 +2548,13 @@ async function renderAcca(u, mode = 'balanced', legsN = 3) {
   let tx = `🎯 <b>${legs.length}-leg accumulator — ${mode}</b>\n\n`;
   legs.forEach(({ m, sc }, i) => {
     const p = sc.pick;
-    odds *= p.odds; prob *= p.p; bestOdds *= (bestPx(m, p));
-    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 ${esc(p.label)} (${p.sign}) ${oddsTxt(p)} · ${pct(p.p)}%\n`;
+    odds *= p.odds; prob *= p.p; bestOdds *= (m.odds.best ? m.odds.best[p.k] : p.odds);
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 ${esc(p.label)} (${p.sign}) @ ${p.odds.toFixed(2)} · ${pct(p.p)}%\n`;
   });
   const ev = prob * odds - 1;
   tx += `\n📦 Combined odds (avg prices): <b>${odds.toFixed(2)}</b> · at best prices: <b>${bestOdds.toFixed(2)}</b>\n`;
   tx += `🎲 Chance all ${legs.length} land: <b>${(prob * 100).toFixed(1)}%</b> · EV ${signed(ev * 100, 0)}%` + stakeTxt(u, prob, odds) + '\n\n';
-  tx += '<i>1X / X2 / 12 / GG / NG legs use fair odds, so real prices will be a bit lower. Legs are treated as independent. Accas multiply the bookmaker margin, so even "safe" ones lose more often than a single bet — keep stakes small.</i>\n\n' + t(u, 'disc');
+  tx += '<i>Legs are treated as independent. Accas multiply the bookmaker margin, so even "safe" ones lose more often than a single bet — keep stakes small.</i>\n\n' + t(u, 'disc');
   return { text: tx, kb };
 }
 
@@ -2927,7 +3048,6 @@ const tierOf = (p) => (p >= 0.6 ? '🟢 High' : p >= 0.5 ? '🟡 Medium' : '🟠
 const dotOf = (p) => tierOf(p).split(' ')[0];
 const pickName = (home, away, k) => (k === 'H' ? `${home} win` : k === 'A' ? `${away} win` : 'Draw');
 const FOLLOW_HINT = '📌 <i>Tap a number below to follow a pick — I\'ll message you the result and track your record (/myrecord).</i>\n\n';
-const MARKET_HINT = COMBO_ON ? '<i>🎯 For every match I compare 1 · 2 · 1X · X2 · 12 · GG · NG and show the most likely one. 1X, X2, 12, GG and NG show <b>fair odds</b> (no bookmaker feed) — only bet if your bookie pays at least that.</i>\n\n' : '';
 const LEGEND = '<i>🟢 High (60%+) · 🟡 Medium (50–60%) · 🟠 Lower (under 50%)</i>\n';
 
 // ----- track record used as social proof (Premium picks only, last N days) -----
@@ -2935,7 +3055,7 @@ function proofLine(days = 30) {
   const since = Date.now() - days * 864e5;
   const rows = predLog.filter((r) => r.res && r.final && r.tags && (r.tags.includes('top5') || r.tags.includes('best3')) && r.utc > since);
   if (rows.length < 5) return '';
-  const hit = rows.filter((r) => pickWon(r.cpick || argmax(r.final), r)).length;
+  const hit = rows.filter((r) => argmax(r.final) === r.res).length;
   const ro = roiOf(rows);
   return `📈 Premium picks, last ${days} days: <b>${hit}/${rows.length}</b> correct (${pct(hit / rows.length)}%)` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
 }
@@ -3005,12 +3125,12 @@ async function renderBest10Pro(u) {
   list.forEach(({ m, st, sc }, i) => {
     const p = sc.pick, k = p.k;
     tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, k)} · ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
-    tx += srcLine(m, st, p, 'Form');
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
+    tx += `   📊 Market ${pct(m.odds.probs[k])}%` + (st.form ? ` · Form ${pct(st.form[k])}%` : '') + (st.ai ? ` · AI ${pct(st.ai.probs[k])}%` : '') + '\n';
     if (st.mk && st.form) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
     const r = reasonOf(m, st);
     if (r) tx += `   <i>${esc(r)}</i>\n`;
-    tx += stakeTxt(u, p.p, bestPx(m, p)) + '\n';
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
   });
   return { text: tx + t(u, 'disc'), kb: followKb(list, null) };
 }
@@ -3039,10 +3159,10 @@ async function renderSafe(u) {
   let tx = `🛡 <b>Safe ${SAFE_TARGET_ODDS.toFixed(1)}-odds slip</b>\n<i>The most likely combination of up to 3 picks that still reaches ${SAFE_TARGET_ODDS.toFixed(1)} total odds.</i>\n\n` + FOLLOW_HINT;
   best.legs.forEach(({ m, sc }, i) => {
     const p = sc.pick;
-    tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)} · ${pct(p.p)}%\n`;
+    tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)} · ${pct(p.p)}%\n`;
   });
   tx += `\n📦 Combined odds: <b>${best.odds.toFixed(2)}</b> · 🎲 Chance all land: <b>${(best.prob * 100).toFixed(1)}%</b> · EV ${signed((best.prob * best.odds - 1) * 100, 0)}%` + stakeTxt(u, best.prob, best.odds) + '\n\n';
-  tx += '<i>1X / X2 / 12 / GG / NG legs use fair odds, so real prices will be a bit lower. Even the safest slip loses often enough — keep stakes small.</i>\n\n' + t(u, 'disc');
+  tx += '<i>Even the safest slip loses often enough — keep stakes small.</i>\n\n' + t(u, 'disc');
   return { text: tx, kb: followKb(best.legs, null) };
 }
 
@@ -3172,11 +3292,12 @@ function hubView(name, u) {
   if (name === 'picks') {
     const proof = proofLine();
     return {
-      text: '🔥 <b>Daily Picks</b>\n━━━━━━━━━━━━━━\n🔟 <b>Best 10</b> — free ranked picks\n🏆 <b>Top 5</b> — the sharpest picks of the day\n💎 <b>Best 3</b> — under-the-radar picks\n🥇 <b>Best 1</b> — the single best pick\n🔟⭐ <b>Best 10 Pro</b> — top 10 with confidence tiers\n🌟 <b>Pick of the Week</b>' + (proof ? `\n\n${proof}` : '') + free,
+      text: '🔥 <b>Daily Picks</b>\n━━━━━━━━━━━━━━\n🔟 <b>Best 10</b> — free ranked picks\n🏆 <b>Top 5</b> — the sharpest picks of the day\n💎 <b>Best 3</b> — under-the-radar picks\n🥇 <b>Best 1</b> — the single best pick\n🔟⭐ <b>Best 10 Pro</b> — top 10 with confidence tiers\n🌟 <b>Pick of the Week</b>\n🎯 <b>Smart 10 / 5 / 3</b> — most likely market per match (1 · 2 · 1X · X2 · 12 · GG · NG)' + (proof ? `\n\n${proof}` : '') + free,
       kb: Markup.inlineKeyboard([
         [LBTN(u, '🔟 Best 10 · Free', 'best10', false), LBTN(u, '🏆 Top 5', 'top5')],
         [LBTN(u, '💎 Best 3', 'best3'), LBTN(u, '🥇 Best 1', 'best1')],
         [LBTN(u, '🔟⭐ Best 10 Pro', 'best10pro'), LBTN(u, '🌟 Pick of the Week', 'potw')],
+        [LBTN(u, '🎯 Smart 10 · Free', 'smart10', false), LBTN(u, '🎯 Smart 5', 'smart5'), LBTN(u, '🎯 Smart 3', 'smart3')],
         back,
       ]),
     };
@@ -3221,7 +3342,7 @@ async function renderTeaserPush(u) {
   let tx = '☀️ <b>Today\'s free tips</b>\n━━━━━━━━━━━━━━\n';
   list.forEach(({ m, sc }, i) => {
     const p = sc.pick;
-    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 <b>${esc(p.label)}</b> ${oddsTxt(p)} · ${dotOf(p.p)} ${pct(p.p)}%\n`;
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)}\n   👉 <b>${esc(p.label)}</b> @ ${p.odds.toFixed(2)} · ${dotOf(p.p)} ${pct(p.p)}%\n`;
   });
   tx += '\n🔒 <i>Today\'s Top 5, Best 3 and Best 1 are ready for Premium members.</i>';
   const proof = proofLine();
@@ -3277,7 +3398,7 @@ async function followTick() {
     const r = predById.get(f.match_id);
     if (!r || !r.res) continue;
     const won = pickWon(f.pick, r);
-    if (won == null) continue; // score not available yet (GG / NG need the final score)
+    if (won == null) continue; // GG / NG need the final score
     const profit = won ? (f.odds ? Number(f.odds) - 1 : 0) : -1;
     const upd = await q('UPDATE followed SET res = $3, won = $4, profit = $5 WHERE user_id = $1 AND match_id = $2 AND won IS NULL RETURNING user_id', [f.user_id, f.match_id, r.res, won, profit]);
     if (!upd.rows.length) continue;
@@ -3595,6 +3716,36 @@ bot.command('best10', detach(picksHandler('best10')));
 bot.action('best10', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best10')(ctx).catch(console.error); });
 bot.command('best1', detach(picksHandler('best1')));
 bot.action('best1', async (ctx) => { await ctx.answerCbQuery(); picksHandler('best1')(ctx).catch(console.error); });
+
+// ----- Smart picks: /smart10 (free) · /smart5 · /smart3 (Premium) -----
+const smartRun = (kind) => toolHandler((ctx) => renderSmart(ctx.u, kind));
+for (const kind of Object.keys(SMART)) {
+  const [label, prem] = SMART[kind];
+  const h = smartRun(kind);
+  bot.command(kind, (ctx) => (prem && !ctx.premium ? paywall(ctx, `🔒 <b>${label}</b> is a Premium feature.`) : detach(h)(ctx)));
+  bot.action(kind, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (prem && !ctx.premium) return paywall(ctx, `🔒 <b>${label}</b> is a Premium feature.`);
+    h(ctx).catch(console.error);
+  });
+}
+const smartMenu = (ctx) => reply(ctx, '🎯 <b>Smart picks</b>\n━━━━━━━━━━━━━━\nFor every match I compare <b>1 · 2 · 1X · X2 · 12 · GG · NG</b> and give you the most likely one.\n\n🎯🔟 <b>Smart 10</b> — free\n🎯🏆 <b>Smart 5</b> — Premium\n🎯💎 <b>Smart 3</b> — under-the-radar, Premium' + (hasPremium(ctx.u) ? '' : '\n\n<i>🔒 = Premium.</i>'),
+  withNav(null, [Object.keys(SMART).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(ctx.u) ? '🔒 ' : '') + SMART[x][0], x))]));
+bot.command('smart', detach(smartMenu));
+bot.action('smart', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); smartMenu(ctx).catch(console.error); });
+bot.action(/^fc:(\d+)$/, async (ctx) => { // follow a Smart pick (settled on its own market: 1X, X2, 12, GG, NG ...)
+  const id = Number(ctx.match[1]);
+  const r = predById.get(id);
+  if (!r || !r.final || r.utc <= Date.now()) return ctx.answerCbQuery('This match has started — it can no longer be followed.', { show_alert: true });
+  if (!r.cpick) return ctx.answerCbQuery('This smart pick is not available to follow.', { show_alert: true });
+  const today = (await q(`SELECT count(*)::int AS n FROM followed WHERE user_id = $1 AND created_at > now() - interval '1 day'`, [ctx.u.id])).rows[0].n;
+  if (today >= MAX_FOLLOW_DAY) return ctx.answerCbQuery(`You can follow up to ${MAX_FOLLOW_DAY} picks a day.`, { show_alert: true });
+  const ins = await q(
+    `INSERT INTO followed (user_id, match_id, home, away, utc, pick, label, odds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING match_id`,
+    [ctx.u.id, id, r.home, r.away, r.utc, r.cpick, r.clabel, r.codds]);
+  return ctx.answerCbQuery(ins.rows.length ? '📌 Following — I\'ll message you the result.' : 'You already follow a pick for this match.', { show_alert: !ins.rows.length });
+});
+
 
 // premium-only analysis tools
 const toolHandler = (render, again) => async (ctx) => {
@@ -3998,12 +4149,11 @@ bot.action(/^fp:(\d+)$/, async (ctx) => {
   if (!r || !r.final || r.utc <= Date.now()) return ctx.answerCbQuery('This match has started — it can no longer be followed.', { show_alert: true });
   const today = (await q(`SELECT count(*)::int AS n FROM followed WHERE user_id = $1 AND created_at > now() - interval '1 day'`, [ctx.u.id])).rows[0].n;
   if (today >= MAX_FOLLOW_DAY) return ctx.answerCbQuery(`You can follow up to ${MAX_FOLLOW_DAY} picks a day.`, { show_alert: true });
-  const combo = COMBO_ON && r.cpick;
-  const k = combo ? r.cpick : r.pubPick || argmax(r.final);
-  const odds = combo ? r.codds : (r.pubOdds || r.odds || {})[k] || null;
+  const k = r.pubPick || argmax(r.final);
+  const odds = (r.pubOdds || r.odds || {})[k] || null;
   const ins = await q(
     `INSERT INTO followed (user_id, match_id, home, away, utc, pick, label, odds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING match_id`,
-    [ctx.u.id, id, r.home, r.away, r.utc, k, combo ? r.clabel : pickName(r.home, r.away, k), odds]);
+    [ctx.u.id, id, r.home, r.away, r.utc, k, pickName(r.home, r.away, k), odds]);
   return ctx.answerCbQuery(ins.rows.length ? '📌 Following — I\'ll message you the result.' : 'You already follow this pick.', { show_alert: !ins.rows.length });
 });
 bot.command('myrecord', sendR((c) => renderMyRecord(c.u)));
@@ -4138,6 +4288,9 @@ const PUBLIC_COMMANDS = [
   { command: 'best3', description: 'Best 3 under-the-radar picks (Premium)' },
   { command: 'best1', description: 'Best single pick of the day (Premium)' },
   { command: 'best10pro', description: 'Best 10 Pro with confidence tiers (Premium)' },
+  { command: 'smart10', description: 'Smart 10: most likely of 1, 2, 1X, X2, 12, GG, NG (free)' },
+  { command: 'smart5', description: 'Smart 5: most likely market per match (Premium)' },
+  { command: 'smart3', description: 'Smart 3: under-the-radar, most likely market (Premium)' },
   { command: 'potw', description: 'Pick of the Week (Premium)' },
   { command: 'today', description: "Today's matches with odds" },
   { command: 'live', description: 'Live scores' },
