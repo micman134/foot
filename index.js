@@ -1883,6 +1883,7 @@ async function initDb() {
     expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
   await q(`CREATE TABLE IF NOT EXISTS promo_redemptions (
     code TEXT, user_id BIGINT, redeemed_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (code, user_id))`);
+  await q(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
   dbReady = true;
 }
 
@@ -1923,10 +1924,14 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
-  "/menu – main menu\n/best10 – 10 free picks · /picks – all pick lists\n/top5 · /best3 · /best1 – top picks (Premium)\n/best10pro · /potw – Pro list &amp; pick of the week (Premium)\n/smart10 · /smart5 · /smart3 – smart picks: 1 · 2 · 1X · X2 · 12 · GG · NG\n" +
-  '/today · /live · /table · /predict\n/value · /goals · /dc · /scores – markets (Premium)\n/result · /htft · /combos · /handicaps · /market – full market boards (Premium)\n/acca · /safe · /weekend – accumulators (Premium)\n' +
-  '/myrecord · /leaders – track your picks\n/watchlist · /subscribe · /stake\n/premium · /redeem · /refer · /account · /settings · /lang\n' +
-  '/stats · /history · /calibration – model track record\n/responsible – stay in control · /help';
+  '<b>📋 All commands</b>\n' +
+  '\n🔥 <b>Picks</b>\n/picks · /best10 · /top5 · /best3 · /best1 · /best10pro · /potw · /vip\n/smart10 · /smart5 · /smart3\n' +
+  '\n⚽ <b>Matches</b>\n/today · /live · /table · /predict\n' +
+  '\n📈 <b>Markets</b> <i>(Premium)</i>\n/markets · /value · /goals · /dc · /scores\n/result · /htft · /combos · /handicaps · /market\n' +
+  '\n🎯 <b>Accumulators</b> <i>(Premium)</i>\n/accas · /acca · /safe · /weekend\n' +
+  '\n👤 <b>My zone</b>\n/myzone · /myrecord · /leaders · /watchlist · /subscribe · /stake\n/refer · /redeem · /account · /settings · /lang\n' +
+  '\n📊 <b>Track record</b>\n/stats · /history · /calibration\n' +
+  '\n💎 /premium · 🛡 /responsible · ❓ /help · 🏠 /menu';
 const TX = {
   en: {
     start: (n) => `👋 <b>Welcome${n ? ', ' + esc(n) : ''}!</b>\n\n⚽ <b>Football Predictions Bot</b>\nBookmaker odds + a goal model + AI, blended into daily picks.\n\n🆓 <b>Free:</b> 🔟 Best 10 every day.\n💎 <b>Premium:</b> Top 5, Best 3, Best 1, value bets, accas and more.\n\nTap a section below to begin 👇`,
@@ -2021,6 +2026,47 @@ function t(u, key, ...args) {
 
 // ---------- Users, plans, quotas ----------
 const hasPremium = (u) => isAdminId(u.id) || (u.plan_until && new Date(u.plan_until).getTime() > Date.now());
+
+// ---------- Free / Premium switches (admin: /free) ----------
+// Each Premium feature can be made free (or locked again) by an admin at any time. The choice is stored in the DB.
+const FEATURES = {
+  top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1', best10pro: '🔟⭐ Best 10 Pro', potw: '🌟 Pick of the Week',
+  weekend: '🏖 Weekend special', vip: '👑 VIP Special', smart5: '🎯 Smart 5', smart3: '🎯 Smart 3', value: '📈 Value bets',
+  goals: '⚽ Goals markets', dc: '🛡 Double chance', safe: '🛡 Safe slip', scores: '🎯 Correct score', acca: '🎯 Accumulators',
+  markets: '📋 All markets', watchlist: '⭐ Watchlist', daily: '🔔 Daily picks push', analysis: '🔍 Unlimited analyses',
+};
+const FREE_FEATURES = new Set();
+const isFree = (key) => FREE_FEATURES.has(key);
+async function loadFree() {
+  try {
+    const r = (await q(`SELECT value FROM settings WHERE key = 'free_features'`)).rows[0];
+    FREE_FEATURES.clear();
+    if (r) JSON.parse(r.value).forEach((k) => { if (FEATURES[k]) FREE_FEATURES.add(k); });
+  } catch (e) { console.log('Could not load free-feature settings:', e.message); }
+}
+const saveFree = () => q(`INSERT INTO settings (key, value) VALUES ('free_features', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify([...FREE_FEATURES])]);
+const CMD_FEATURE = {
+  top5: 'top5', best3: 'best3', best1: 'best1', best10pro: 'best10pro', potw: 'potw', weekend: 'weekend', safe: 'safe', scores: 'scores', vip: 'vip',
+  smart5: 'smart5', smart3: 'smart3', value: 'value', goals: 'goals', dc: 'dc', acca: 'acca', watchlist: 'watchlist', subscribe: 'daily',
+  result: 'markets', htft: 'markets', combos: 'markets', handicaps: 'markets', market: 'markets', predict: 'analysis',
+};
+const CB_FEATURE = [
+  [/^(top5|best3|best1|best10pro|potw|weekend|safe|scores|vip|smart5|smart3|value|goals|dc)$/, (m) => m[1]],
+  [/^acca(:|$)/, 'acca'], [/^(mk:|am:|mkhelp)/, 'markets'], [/^w:/, 'watchlist'], [/^set:sub$/, 'daily'], [/^m:\d+:\d+$/, 'analysis'],
+];
+const MENU_FEATURE = { '🏆 Top 5': 'top5', '💎 Best 3': 'best3', '📈 Value': 'value', '🎯 Acca': 'acca', '⭐ Watchlist': 'watchlist' };
+function cbFeature(d) {
+  for (const [re, k] of CB_FEATURE) { const m = re.exec(d); if (m) return typeof k === 'function' ? k(m) : k; }
+  return null;
+}
+const dataFree = (d) => { const k = cbFeature(d); return !!k && isFree(k); };
+function featureKeyOf(ctx) {
+  if (ctx.callbackQuery && ctx.callbackQuery.data) return cbFeature(ctx.callbackQuery.data);
+  const txt = ctx.message && ctx.message.text;
+  if (!txt) return null;
+  const c = /^\/(\w+)/.exec(txt);
+  return c ? CMD_FEATURE[c[1].toLowerCase()] || null : MENU_FEATURE[txt] || null;
+}
 const fmtUntil = (d) => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric' }).format(new Date(d));
 
 async function updUser(id, fields) {
@@ -2362,7 +2408,7 @@ async function renderDetailFor(m, backData, u) {
   } else tx += 'Not enough data to predict this one.\n';
   tx += '\n' + t(u, 'disc');
   const rows = [[Markup.button.callback('⭐ Watch', `w:${m.id}`), Markup.button.callback('🔁 H2H history', `h2h:${m.id}`)]];
-  rows.push([Markup.button.callback((hasPremium(u) ? '' : '🔒 ') + '📋 All markets (GG, O/U, HT/FT, handicaps…)', `am:${m.id}`)]);
+  rows.push([Markup.button.callback((hasPremium(u) || isFree('markets') ? '' : '🔒 ') + '📋 All markets (GG, O/U, HT/FT, handicaps…)', `am:${m.id}`)]);
   if (backData) rows.push([Markup.button.callback('⬅️ Back to list', backData)]);
   rows.push([Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
@@ -2477,7 +2523,7 @@ async function renderSmart(u, kind) {
   const rows = [];
   const fb = list.map((x, i) => Markup.button.callback(`📌 ${i + 1}`, `fc:${x.m.id}`));
   for (let i = 0; i < fb.length; i += 5) rows.push(fb.slice(i, i + 5));
-  rows.push(Object.keys(SMART).filter((x) => x !== kind).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(u) ? '🔒 ' : '') + SMART[x][0], x)));
+  rows.push(Object.keys(SMART).filter((x) => x !== kind).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(u) && !isFree(x) ? '🔒 ' : '') + SMART[x][0], x)));
   return { text: tx + t(u, 'disc'), kb: Markup.inlineKeyboard(rows) };
 }
 
@@ -3135,6 +3181,33 @@ async function renderBest10Pro(u) {
   return { text: tx + t(u, 'disc'), kb: followKb(list, null) };
 }
 
+
+// ----- VIP Special (Premium): the matches with the highest model win probability today -----
+// The % is the REAL blended estimate (bookmaker odds + goals model + AI), never inflated.
+const VIP_MIN_P = Number(process.env.VIP_MIN_P || 0.6);
+const VIP_COUNT = Number(process.env.VIP_COUNT || 3);
+async function renderVip(u) {
+  const all = (await computeRanked()).filter(isUpcoming);
+  const wins = applyPrefs(all, u).filter((x) => x.sc.pick.k !== 'D').sort((a, b) => b.sc.pick.p - a.sc.pick.p || b.sc.agreeN - a.sc.agreeN);
+  if (!wins.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null };
+  const strong = wins.filter((x) => x.sc.pick.p >= VIP_MIN_P);
+  const list = (strong.length ? strong : wins).slice(0, VIP_COUNT);
+  let tx = '👑 <b>VIP Special — most likely winners today</b>\n<i>The matches where one side has the highest win probability across bookmaker odds, the goals model and AI.</i>\n';
+  if (!strong.length) tx += `<i>No match reaches ${pct(VIP_MIN_P)}% today — these are the strongest available.</i>\n`;
+  tx += '\n' + FOLLOW_HINT;
+  list.forEach(({ m, st, sc }, i) => {
+    const p = sc.pick, k = p.k;
+    tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += `   🏆 <b>${esc(p.label)}</b> @ ${p.odds.toFixed(2)}${bestPriceTxt(m, k)} · <b>${pct(p.p)}%</b> win probability\n`;
+    tx += `   📊 Market ${pct(m.odds.probs[k])}%` + (st.form ? ` · Form ${pct(st.form[k])}%` : '') + (st.ai ? ` · AI ${pct(st.ai.probs[k])}%` : '') + ` · ${sc.agreeN}/${sc.total} sources agree\n`;
+    const r = reasonOf(m, st);
+    if (r) tx += `   <i>${esc(r)}</i>\n`;
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
+  });
+  tx += '<i>A high % means more likely, not certain — favourites still lose.</i>\n';
+  return { text: tx + t(u, 'disc'), kb: followKb(list, null) };
+}
+
 // ----- Safe slip (Premium): safest combination of 1-3 picks that reaches the target combined odds -----
 async function renderSafe(u) {
   const pool = byLeague(await accaPool(), u)
@@ -3284,8 +3357,9 @@ const mainKb = (u) => Markup.inlineKeyboard([
   [Markup.button.callback('🔴 Live Scores', 'live'), Markup.button.callback('📊 Tables', 'tbl')],
   [Markup.button.callback('👤 My Zone', 'hub:me'), Markup.button.callback('⚙️ Settings', 'st')],
   [Markup.button.callback(hasPremium(u) ? '💎 My Premium' : '💎 Go Premium', 'up'), Markup.button.callback('🛡 Responsible', 'resp'), Markup.button.callback('❓ Help', 'help')],
+  ...(isAdminId(u.id) ? [[Markup.button.callback('🛡 Admin panel', 'adm:open')]] : []),
 ]);
-const LBTN = (u, label, data, prem = true) => Markup.button.callback((prem && !hasPremium(u) ? '🔒 ' : '') + label, data);
+const LBTN = (u, label, data, prem = true) => Markup.button.callback((prem && !hasPremium(u) && !dataFree(data) ? '🔒 ' : '') + label, data);
 function hubView(name, u) {
   const back = [Markup.button.callback('⬅️ Menu', 'menu')];
   const free = hasPremium(u) ? '' : '\n<i>🔒 = Premium. Tap one to preview it.</i>';
@@ -3297,6 +3371,7 @@ function hubView(name, u) {
         [LBTN(u, '🔟 Best 10 · Free', 'best10', false), LBTN(u, '🏆 Top 5', 'top5')],
         [LBTN(u, '💎 Best 3', 'best3'), LBTN(u, '🥇 Best 1', 'best1')],
         [LBTN(u, '🔟⭐ Best 10 Pro', 'best10pro'), LBTN(u, '🌟 Pick of the Week', 'potw')],
+        [LBTN(u, '👑 VIP Special', 'vip')],
         [LBTN(u, '🎯 Smart 10 · Free', 'smart10', false), LBTN(u, '🎯 Smart 5', 'smart5'), LBTN(u, '🎯 Smart 3', 'smart3')],
         back,
       ]),
@@ -3413,7 +3488,7 @@ async function pushTick() {
   if (Date.now() < pushBackoffUntil) return;
   const now = new Date();
   const { rows } = await q(
-    `SELECT * FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]))`, [ADMIN_IDS]);
+    `SELECT * FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]) OR $2::boolean)`, [ADMIN_IDS, isFree('daily')]);
   const due = rows.filter((u) => {
     const h = hourTz(now, u.tz);
     return u.last_push !== localDateTz(now, u.tz) && h >= u.push_hour && h < u.push_hour + 4;
@@ -3490,7 +3565,7 @@ async function settleTick() {
     tx += `${k === r.res ? '✅' : '❌'} ${esc(r.home)} vs ${esc(r.away)} — pick ${sign1x2[k]}, result ${sign1x2[r.res]}${r.score ? ' (' + r.score + ')' : ''}\n`;
   }
   tx += `\n<b>${won}/${fresh.length}</b> correct. Full record: /stats · /history`;
-  const subs = (await q(`SELECT id FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]))`, [ADMIN_IDS])).rows;
+  const subs = (await q(`SELECT id FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]) OR $2::boolean)`, [ADMIN_IDS, isFree('daily')])).rows;
   for (const s of subs) { await sendTo(s.id, tx); await sleep(40); }
 }
 let tickN = 0, ticking = false;
@@ -3555,6 +3630,7 @@ bot.use(async (ctx, next) => {
     }
   }
   ctx.premium = hasPremium(ctx.u);
+  if (!ctx.premium) { const fk = featureKeyOf(ctx); if (fk && isFree(fk)) ctx.premium = true; } // admin made this feature free
   return next();
 });
 const paywall = (ctx, text) => {
@@ -3704,7 +3780,7 @@ const picksHandler = (kind) => async (ctx) => {
       : await (kind === 'top5' ? renderTop5 : renderBest3)(ctx.u, { full: true, only1: kind === 'best1' });
     await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
     const SIB = { best10: ['🔟 Best 10', false], top5: ['🏆 Top 5', true], best3: ['💎 Best 3', true], best1: ['🥇 Best 1', true] };
-    const others = Object.keys(SIB).filter((x) => x !== kind).map((x) => Markup.button.callback((SIB[x][1] && !ctx.premium ? '🔒 ' : '') + SIB[x][0], x));
+    const others = Object.keys(SIB).filter((x) => x !== kind).map((x) => Markup.button.callback((SIB[x][1] && !hasPremium(ctx.u) && !isFree(x) ? '🔒 ' : '') + SIB[x][0], x));
     await replyLong(ctx, r.text, withNav(r.kb, [others, [Markup.button.callback('🔥 Picks hub', 'hub:picks'), Markup.button.callback('⚽ Today', 'today')]]));
   } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
 };
@@ -3744,7 +3820,7 @@ for (const kind of Object.keys(SMART)) {
   });
 }
 const smartMenu = (ctx) => reply(ctx, '🎯 <b>Smart picks</b>\n━━━━━━━━━━━━━━\nFor every match I compare <b>1 · 2 · 1X · X2 · 12 · GG · NG</b> and give you the most likely one.\n\n🎯🔟 <b>Smart 10</b> — free\n🎯🏆 <b>Smart 5</b> — Premium\n🎯💎 <b>Smart 3</b> — under-the-radar, Premium' + (hasPremium(ctx.u) ? '' : '\n\n<i>🔒 = Premium.</i>'),
-  withNav(null, [Object.keys(SMART).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(ctx.u) ? '🔒 ' : '') + SMART[x][0], x))]));
+  withNav(null, [Object.keys(SMART).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(ctx.u) && !isFree(x) ? '🔒 ' : '') + SMART[x][0], x))]));
 bot.command('smart', detach(smartMenu));
 bot.action('smart', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); smartMenu(ctx).catch(console.error); });
 bot.action(/^fc:(\d+)$/, async (ctx) => { // follow a Smart pick (settled on its own market: 1X, X2, 12, GG, NG ...)
@@ -3987,8 +4063,8 @@ bot.on('inline_query', async (ctx) => {
 // ----- admin tools (admins have every feature, no limits) -----
 const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
-  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
-bot.command('admin', adminOnly((ctx) => reply(ctx, ADMIN_HELP)));
+  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/free – choose which Premium features are free\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
+bot.command('admin', adminOnly((ctx) => showAdmin(ctx)));
 bot.command('resolve', adminOnly(detach(async (ctx) => {
   const now = Date.now();
   const openNow = () => predLog.filter((r) => !r.res && r.utc < now - 3 * 3600e3 && r.utc > now - 5 * 864e5);
@@ -4063,6 +4139,74 @@ const broadcast = (premiumOnly) => adminOnly(async (ctx) => {
 });
 bot.command('broadcast', broadcast(false));
 bot.command('broadcastp', broadcast(true));
+
+// ----- admin: Free / Premium switches -----
+const freeView = () => {
+  const keys = Object.keys(FEATURES);
+  const rows = [];
+  for (let i = 0; i < keys.length; i += 2) rows.push(keys.slice(i, i + 2).map((k) => Markup.button.callback((isFree(k) ? '🟢 ' : '🔒 ') + FEATURES[k], `ff:${k}`)));
+  rows.push([Markup.button.callback('🟢 All free', 'ff:*on'), Markup.button.callback('🔒 All Premium', 'ff:*off')]);
+  rows.push([Markup.button.callback('⬅️ Admin panel', 'adm:open')]);
+  const n = keys.filter(isFree).length;
+  return { text: `🔓 <b>Free / Premium switches</b>\n🟢 = free for everyone · 🔒 = Premium only\nTap a feature to flip it — it takes effect immediately.\n\n<b>${n}</b> of ${keys.length} features are free right now. Admins always have everything.`, kb: Markup.inlineKeyboard(rows) };
+};
+bot.command('free', adminOnly((ctx) => { const v = freeView(); return reply(ctx, v.text, v.kb); }));
+bot.action(/^ff:(.+)$/, async (ctx) => {
+  if (!ctx.isAdmin) return ctx.answerCbQuery().catch(() => {});
+  const k = ctx.match[1];
+  if (k === '*on') Object.keys(FEATURES).forEach((x) => FREE_FEATURES.add(x));
+  else if (k === '*off') FREE_FEATURES.clear();
+  else if (FEATURES[k]) { if (FREE_FEATURES.has(k)) FREE_FEATURES.delete(k); else FREE_FEATURES.add(k); }
+  else return ctx.answerCbQuery('Unknown feature').catch(() => {});
+  let saved = true;
+  try { await saveFree(); } catch (e) { saved = false; console.error('saveFree failed:', e.message); }
+  await ctx.answerCbQuery(saved ? (k.startsWith('*') ? 'Updated' : `${FEATURES[k]}: ${isFree(k) ? 'now FREE' : 'now Premium'}`) : '⚠️ Changed, but could not save (will reset on restart)', { show_alert: !saved }).catch(() => {});
+  const v = freeView();
+  await editOrReply(ctx, v.text, v.kb);
+});
+
+// ----- admin: panel with buttons (every admin command one tap away) -----
+const ADMIN_RUN = { users: '/users', payments: '/payments', dashboard: '/dashboard', credits: '/credits', feedstatus: '/feedstatus', resolve: '/resolve', promo: '/promo', free: '/free', pick: '/pick' };
+const ADMIN_HINT = {
+  broadcast: '📣 Send to everyone:\n<code>/broadcast your message</code> (HTML allowed)',
+  broadcastp: '💎 Send to Premium users only:\n<code>/broadcastp your message</code>',
+  grant: '🎁 Give Premium days:\n<code>/grant &lt;userId&gt; &lt;days&gt;</code>',
+  revoke: '⛔ Remove Premium:\n<code>/revoke &lt;userId&gt;</code>',
+  ban: '🚫 Ban a user:\n<code>/ban &lt;userId&gt;</code>',
+  unban: '✅ Unban a user:\n<code>/unban &lt;userId&gt;</code>',
+  userinfo: '👤 Look up a user:\n<code>/userinfo &lt;userId&gt;</code>',
+  unexclude: '🔓 Lift a self-exclusion:\n<code>/unexclude &lt;userId&gt;</code>',
+};
+const ADMIN_PANEL_TEXT = '🛡 <b>Admin panel</b>\nTap a tool. Tools that need details (a user ID, a message) tell you exactly what to send.';
+const adminKb = () => {
+  const b = (label, data) => Markup.button.callback(label, `adm:${data}`);
+  return Markup.inlineKeyboard([
+    [b('👥 Users', 'users'), b('💳 Payments', 'payments'), b('📈 Dashboard', 'dashboard')],
+    [b('🔓 Free / Premium', 'free'), b('👥 Pick contacts', 'pick'), b('🎟 Promo codes', 'promo')],
+    [b('🔑 Odds credits', 'credits'), b('📡 Feed status', 'feedstatus'), b('✅ Settle results', 'resolve')],
+    [b('📣 Broadcast', 'broadcast'), b('💎 Broadcast Premium', 'broadcastp')],
+    [b('🎁 Grant', 'grant'), b('⛔ Revoke', 'revoke'), b('👤 User info', 'userinfo')],
+    [b('🚫 Ban', 'ban'), b('✅ Unban', 'unban'), b('🔓 Unexclude', 'unexclude')],
+    [b('♻️ Clear caches', 'forceupdate'), b('📖 All commands', 'help')],
+    [Markup.button.callback('🏠 Menu', 'menu')],
+  ]);
+};
+const showAdmin = (ctx) => reply(ctx, ADMIN_PANEL_TEXT, adminKb());
+const runAsCommand = (ctx, text) => { // re-run an admin command exactly as if it was typed
+  const cb = ctx.callbackQuery, msg = cb.message;
+  return bot.handleUpdate({ update_id: Date.now(), message: { message_id: msg.message_id, date: Math.floor(Date.now() / 1000), chat: msg.chat, from: cb.from, text, entities: [{ type: 'bot_command', offset: 0, length: text.split(' ')[0].length }] } });
+};
+bot.action(/^adm:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.isAdmin) return;
+  const k = ctx.match[1];
+  if (k === 'open') return editOrReply(ctx, ADMIN_PANEL_TEXT, adminKb());
+  if (k === 'help') return reply(ctx, ADMIN_HELP);
+  if (k === 'forceupdate') return reply(ctx, '♻️ Clear all caches? The next /today or /top5 re-downloads everything and uses API credits.', Markup.inlineKeyboard([[Markup.button.callback('✅ Yes, clear', 'adm:forceupdate_yes'), Markup.button.callback('Cancel', 'adm:open')]]));
+  if (k === 'forceupdate_yes') return runAsCommand(ctx, '/forceupdate');
+  if (ADMIN_RUN[k]) return runAsCommand(ctx, ADMIN_RUN[k]);
+  if (ADMIN_HINT[k]) return reply(ctx, ADMIN_HINT[k]);
+});
 
 // ----- admin: pick people from YOUR Telegram contact list and send them today's picks or your own message -----
 // /pick opens Telegram's native contact picker (request_users button). The bot only receives the user IDs you tick.
@@ -4171,6 +4315,7 @@ const PREM_TOOLS = {
   safe: ['🛡 Safe slip', (c) => renderSafe(c.u)],
   scores: ['🎯 Correct score', (c) => renderScores(c.u)],
   potw: ['🌟 Pick of the Week', (c) => renderPotw(c.u)],
+  vip: ['👑 VIP Special', (c) => renderVip(c.u)],
   weekend: ['🏖 Weekend special', (c) => renderWeekend(c.u)],
   goals: ['⚽ Goals markets', (c) => renderGoals(c.u)],
   dc: ['🛡 Double chance', (c) => renderDC(c.u)],
@@ -4353,54 +4498,24 @@ bot.catch((err) => console.error('Bot error:', err));
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
 
-const PUBLIC_COMMANDS = [
-  { command: 'menu', description: 'Open the main menu' },
-  { command: 'best10', description: 'Best 10 picks of the day (free)' },
-  { command: 'picks', description: 'All pick lists' },
-  { command: 'top5', description: 'Top 5 picks of the day (Premium)' },
-  { command: 'best3', description: 'Best 3 under-the-radar picks (Premium)' },
-  { command: 'best1', description: 'Best single pick of the day (Premium)' },
-  { command: 'best10pro', description: 'Best 10 Pro with confidence tiers (Premium)' },
-  { command: 'smart10', description: 'Smart 10: most likely of 1, 2, 1X, X2, 12, GG, NG (free)' },
-  { command: 'smart5', description: 'Smart 5: most likely market per match (Premium)' },
-  { command: 'smart3', description: 'Smart 3: under-the-radar, most likely market (Premium)' },
-  { command: 'potw', description: 'Pick of the Week (Premium)' },
-  { command: 'today', description: "Today's matches with odds" },
-  { command: 'live', description: 'Live scores' },
-  { command: 'table', description: 'League table' },
-  { command: 'predict', description: 'Predict any upcoming match' },
-  { command: 'value', description: 'Value bets (Premium)' },
-  { command: 'goals', description: 'Goals markets (Premium)' },
-  { command: 'dc', description: 'Safer markets: DC / DNB (Premium)' },
-  { command: 'scores', description: 'Correct-score suggestions (Premium)' },
-  { command: 'result', description: '1X2, Double Chance, DNB board (Premium)' },
-  { command: 'htft', description: 'HT/FT, win either half, score both halves (Premium)' },
-  { command: 'combos', description: 'Combo markets: 1 & GG, 1 & OV 2.5… (Premium)' },
-  { command: 'handicaps', description: 'Handicaps and Asian handicap (Premium)' },
-  { command: 'market', description: 'Every market for one match (Premium)' },
-  { command: 'acca', description: 'Accumulator builder (Premium)' },
-  { command: 'safe', description: 'Safe 2-odds slip (Premium)' },
-  { command: 'weekend', description: 'Weekend special acca (Premium)' },
-  { command: 'myrecord', description: 'Your followed picks and win rate' },
-  { command: 'leaders', description: 'Monthly leaderboard' },
-  { command: 'watchlist', description: 'Matches you follow (Premium)' },
-  { command: 'stake', description: 'Kelly stake calculator' },
-  { command: 'subscribe', description: 'Daily picks in your chat (Premium)' },
-  { command: 'settings', description: 'Leagues, push time, language' },
-  { command: 'premium', description: 'Unlock everything' },
-  { command: 'redeem', description: 'Redeem a promo code' },
-  { command: 'refer', description: 'Invite friends, earn free days' },
-  { command: 'account', description: 'Your plan and usage' },
-  { command: 'stats', description: 'Model accuracy & ROI' },
-  { command: 'history', description: 'Recent published picks' },
-  { command: 'calibration', description: 'Are the probabilities honest?' },
-  { command: 'responsible', description: 'Responsible play & self-exclusion' },
-  { command: 'help', description: 'How predictions work' },
+const PUBLIC_COMMANDS = [ // the "/" menu shows categories only; every other command still works when typed (see /help)
+  { command: 'menu', description: '🏠 Main menu' },
+  { command: 'picks', description: '🔥 Daily picks: Best 10, Top 5, Best 3, Smart…' },
+  { command: 'vip', description: '👑 VIP special: most likely winners today' },
+  { command: 'today', description: "⚽ Today's matches with odds" },
+  { command: 'live', description: '🔴 Live scores' },
+  { command: 'markets', description: '📈 Markets: value, goals, HT/FT, combos…' },
+  { command: 'accas', description: '🎯 Accumulators: builder, safe slip, weekend' },
+  { command: 'myzone', description: '👤 My zone: record, watchlist, refer, account' },
+  { command: 'settings', description: '⚙️ Leagues, push time, language' },
+  { command: 'premium', description: '💎 Unlock everything' },
+  { command: 'help', description: '❓ Help & all commands' },
 ];
 
 // ----- startup -----
 async function main() {
   await initDb();
+  await loadFree();
   await loadPredLog();
   console.log(`PostgreSQL ready · ${predLog.length} logged predictions · admins: ${ADMIN_IDS.length || 'NONE (set ADMIN_IDS)'} · Paystack: ${PAYSTACK_KEY ? 'on' : 'off'} · Stars: ${STARS_ON ? 'on' : 'off'}`);
   bot.telegram.setMyCommands(PUBLIC_COMMANDS).catch(() => {});
