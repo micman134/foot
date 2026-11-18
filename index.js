@@ -3987,7 +3987,7 @@ bot.on('inline_query', async (ctx) => {
 // ----- admin tools (admins have every feature, no limits) -----
 const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
-  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
+  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
 bot.command('admin', adminOnly((ctx) => reply(ctx, ADMIN_HELP)));
 bot.command('resolve', adminOnly(detach(async (ctx) => {
   const now = Date.now();
@@ -4063,6 +4063,80 @@ const broadcast = (premiumOnly) => adminOnly(async (ctx) => {
 });
 bot.command('broadcast', broadcast(false));
 bot.command('broadcastp', broadcast(true));
+
+// ----- admin: pick people from YOUR Telegram contact list and send them today's picks or your own message -----
+// /pick opens Telegram's native contact picker (request_users button). The bot only receives the user IDs you tick.
+// Telegram only lets a bot message people who already pressed Start on it, so others are reported back to you.
+const pickState = new Map(); // adminId -> { ids: number[], awaitingText: boolean }
+const SHARE_REQ_ID = 7;
+const ADMIN_SIGN = process.env.ADMIN_SIGNATURE || '— Admin';
+bot.command('pick', adminOnly((ctx) => reply(ctx,
+  '👥 Tap <b>Choose contacts</b> to open your Telegram contact list and tick who should receive it (up to 10 per round).\nThey must have pressed Start on this bot before.',
+  Markup.keyboard([
+    [{ text: '👥 Choose contacts', request_users: { request_id: SHARE_REQ_ID, user_is_bot: false, max_quantity: 10 } }],
+    ['❌ Cancel'],
+  ]).oneTime().resize())));
+bot.hears('❌ Cancel', adminOnly(async (ctx) => { pickState.delete(ctx.from.id); await ctx.reply('Cancelled.', Markup.removeKeyboard()); }));
+
+bot.on('message', async (ctx, next) => {
+  if (!ctx.isAdmin) return next();
+  const m = ctx.message;
+  if (m.users_shared) {
+    const ids = (m.users_shared.users || []).map((u) => Number(u.user_id)).filter(Boolean);
+    if (!ids.length) return reply(ctx, 'No contacts selected.');
+    const known = (await q('SELECT id, first_name, username FROM users WHERE id = ANY($1::bigint[]) AND NOT banned AND NOT blocked', [ids])).rows;
+    const okIds = new Set(known.map((r) => Number(r.id)));
+    const missing = ids.filter((id) => !okIds.has(id));
+    pickState.set(ctx.from.id, { ids: [...okIds], awaitingText: false });
+    let tx = `👥 You selected <b>${ids.length}</b>.\n`;
+    tx += known.length ? `✅ Can receive: ${known.map((r) => esc(r.first_name || r.username || String(r.id))).join(', ')}\n` : '⚠️ None of them can receive messages yet.\n';
+    if (missing.length) tx += `⚠️ ${missing.length} haven't started the bot (Telegram blocks messages to them) — send them your bot link first.\n`;
+    if (!known.length) return reply(ctx, tx, Markup.removeKeyboard());
+    await ctx.reply('✔️', Markup.removeKeyboard());
+    return reply(ctx, tx + '\nWhat should I send?', Markup.inlineKeyboard([
+      [Markup.button.callback("📊 Today's picks", 'pk:picks')],
+      [Markup.button.callback('✉️ My own message', 'pk:msg')],
+      [Markup.button.callback('❌ Cancel', 'pk:x')],
+    ]));
+  }
+  const st = pickState.get(ctx.from.id);
+  if (st && st.awaitingText && m.text && !m.text.startsWith('/')) {
+    pickState.delete(ctx.from.id);
+    const body = `${m.text}\n\n<i>${esc(ADMIN_SIGN)}</i>`; // HTML allowed, same as /broadcast
+    (async () => {
+      let ok = 0;
+      for (const id of st.ids) { if (await sendTo(id, body)) ok++; await sleep(60); }
+      await sendTo(ctx.from.id, `✉️ Sent: ${ok}/${st.ids.length} delivered.`);
+    })().catch(console.error);
+    return reply(ctx, `✉️ Sending to ${st.ids.length}…`);
+  }
+  return next();
+});
+bot.action(/^pk:(picks|msg|x)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.isAdmin) return;
+  const act = ctx.match[1];
+  const st = pickState.get(ctx.from.id);
+  if (act === 'x' || !st || !st.ids.length) { pickState.delete(ctx.from.id); return reply(ctx, act === 'x' ? 'Cancelled.' : 'Selection expired — run /pick again.'); }
+  if (act === 'msg') { st.awaitingText = true; return reply(ctx, '✍️ Type your message now (HTML allowed). It will be sent with your signature. Send /pick to start over.'); }
+  pickState.delete(ctx.from.id);
+  await reply(ctx, `📊 Sending today's picks to ${st.ids.length}…`);
+  (async () => {
+    let ok = 0, empty = false;
+    for (const id of st.ids) {
+      const u = (await q('SELECT * FROM users WHERE id = $1', [id])).rows[0];
+      if (!u) continue;
+      const [a, b] = [await renderTop5(u, { full: true }), await renderBest3(u, { full: true })];
+      if (a.empty && b.empty) { empty = true; break; }
+      let sent = await sendTo(id, `📨 <b>Today's picks — from the Admin</b>`);
+      if (!a.empty) sent = (await sendTo(id, a.text, a.kb ? { reply_markup: a.kb.reply_markup } : {})) || sent;
+      if (!b.empty) sent = (await sendTo(id, b.text, b.kb ? { reply_markup: b.kb.reply_markup } : {})) || sent;
+      if (sent) ok++;
+      await sleep(80);
+    }
+    await sendTo(ctx.from.id, empty ? '⚠️ No picks available yet (odds not out). Try again later.' : `📊 Picks delivered to ${ok}/${st.ids.length}.`);
+  })().catch(console.error);
+});
 bot.command('forceupdate', adminOnly(async (ctx) => {
   const n = cache.size;
   cache.clear();
