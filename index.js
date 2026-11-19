@@ -96,6 +96,19 @@ const COMBO_DC = process.env.COMBO_DC !== 'off';                         // /sma
 const COMBO_GOALS = process.env.COMBO_GOALS !== 'off';                   // /smart picks: allow GG / NG
 const COMBO_MIN_ODDS = Number(process.env.COMBO_MIN_ODDS || 1.15);       // minimum FAIR odds for a 1X / X2 / 12 / GG / NG pick (raise to 1.25+ to skip very short prices)
 const COMBO_MARGIN = Number(process.env.COMBO_MARGIN || 0.06);           // bookmaker margin assumed when a followed smart pick is scored
+const WEEK_FLOOR = Number(process.env.WEEK_FLOOR || 0.55);               // /week: lowest chance a user may choose in the options (candidate pool is built from this)
+const W_ELO = Number(process.env.W_ELO || 0.25);                         // share of the Elo model inside the 1X2 "form" signal
+const ELO_K = Number(process.env.ELO_K || 22);                           // Elo update speed
+const ELO_HA = Number(process.env.ELO_HA || 60);                         // Elo home-advantage points
+const MOMENTUM = Number(process.env.MOMENTUM || 0.03);                   // goal-rate change per 1 pt/game of recent form vs season form (capped +-5%)
+const VENUE_ADJ_ON = process.env.VENUE_ADJ !== 'off';                    // team-specific home / away scoring split
+const H2H_ADJ_ON = process.env.H2H_ADJ !== 'off';                        // small head-to-head nudge
+const REST_ADJ_ON = process.env.REST_ADJ !== 'off';                      // fatigue when the last league game was under 3.5 days ago
+const CAL_MIN = Number(process.env.CAL_MIN || 120);                      // finished predictions needed before self-calibration switches on
+const WEEK_DAYS = Number(process.env.WEEK_DAYS || 7);                    // /week: days covered (today included)
+const WEEK_PER_DAY = Number(process.env.WEEK_PER_DAY || 2);              // /week: picks per day
+const WEEK_MIN_P = Number(process.env.WEEK_MIN_P || 0.7);                // /week: every pick must be ABOVE this chance (0.7 = 70%)
+const WEEK_AI_PER_DAY = Number(process.env.WEEK_AI_PER_DAY || 6);        // /week: candidates per day that get an AI opinion (keeps API use low)
 const MIN_PICK_ODDS = Number(process.env.MIN_PICK_ODDS || 1.15); // skip "pointless" 1.05 favourites in Top 5
 const MAX_AI_MATCHES = Number(process.env.MAX_AI_MATCHES || 40); // how many top candidates get an LLM opinion
 // ----- Model tuning -----
@@ -549,7 +562,7 @@ async function extraAnalysis(m) {
     .map((g) => (g.home ? `${m.home} ${g.gf}-${g.ga} ${g.opp}` : `${g.opp} ${g.ga}-${g.gf} ${m.home}`) + ` (${fmtDate(g.date)})`);
   const mkt = m.odds ? m.odds.probs : null;
   const disagree = mkt && form ? 0.5 * ['H', 'D', 'A'].reduce((x, k) => x + Math.abs(mkt[k] - form[k]), 0) : null;
-  return { hs: summarise(hg), as: summarise(ag), histH: hg.slice(0, 8), histA: ag.slice(0, 8), form, h2h, mkt, disagree, final: blend(mkt, form, null), ai: null };
+  return { hs: summarise(hg), as: summarise(ag), histH: hg.slice(0, 8), histA: ag.slice(0, 8), form, h2h, mkt, disagree, finalRaw: blendRaw(mkt, form, null), final: blend(mkt, form, null), ai: null };
 }
 
 // Third source: The Odds API "events" lists (free, no credits used) - covers every in-season soccer competition it prices.
@@ -989,7 +1002,7 @@ function clampToMarket(ai, mkt) {
 
 // Log-linear (geometric) opinion pool: a source only moves the result where it is confident and the others are not,
 // which beats a plain average when sources are correlated. Form weight shrinks when data is thin.
-function blend(mkt, form, ai) {
+function blendRaw(mkt, form, ai) {
   const parts = [];
   if (mkt) parts.push([mkt, W_MKT]);
   if (form) parts.push([form, W_FORM * (form.rel == null ? 1 : form.rel)]);
@@ -1002,6 +1015,36 @@ function blend(mkt, form, ai) {
   for (const k of ['H', 'D', 'A']) { out[k] = Math.exp(out[k]); t += out[k]; }
   for (const k of ['H', 'D', 'A']) out[k] /= t;
   return out;
+}
+
+// Self-calibration: a temperature fitted on YOUR finished predictions (p^(1/T)). T > 1 flattens over-confident probabilities, T < 1 sharpens
+// under-confident ones. Raw (uncalibrated) blends are logged, so the fit never feeds on its own output.
+let CAL = { T: 1, n: 0 };
+function calibrateProbs(p) {
+  if (!p || CAL.T === 1) return p;
+  const out = {};
+  let t = 0;
+  for (const k of ['H', 'D', 'A']) { out[k] = Math.pow(Math.max(p[k], 1e-6), 1 / CAL.T); t += out[k]; }
+  for (const k of ['H', 'D', 'A']) out[k] /= t;
+  return out;
+}
+const blend = (mkt, form, ai) => calibrateProbs(blendRaw(mkt, form, ai));
+function fitCalibration() {
+  const rows = predLog.filter((r) => r.res && (r.raw || r.final));
+  if (rows.length < CAL_MIN) { CAL = { T: 1, n: rows.length }; return CAL; }
+  const ll = (T) => rows.reduce((sum, r) => {
+    const pr = r.raw || r.final;
+    let t = 0;
+    const q2 = {};
+    for (const k of ['H', 'D', 'A']) { q2[k] = Math.pow(Math.max(pr[k], 1e-6), 1 / T); t += q2[k]; }
+    return sum - Math.log(Math.max(q2[r.res] / t, 1e-6));
+  }, 0) / rows.length;
+  const base = ll(1);
+  let best = { T: 1, v: base };
+  for (let T = 0.8; T <= 1.5001; T += 0.02) { const v = ll(T); if (v < best.v) best = { T, v }; }
+  const shrink = rows.length / (rows.length + 100); // trust the fit more as the sample grows
+  CAL = { T: 1 + (best.T - 1) * shrink, n: rows.length, fitted: best.T, gain: base - best.v };
+  return CAL;
 }
 
 // ---------- AI model (online, OpenAI-compatible) ----------
@@ -1146,6 +1189,104 @@ async function hfPredict(m, st) {
 }
 
 // ---------- Analysis pipeline ----------
+// ---------- Extra techniques layered on the goal model (applied to EVERY prediction through statAnalysis) ----------
+const clampN2 = (x, a, b) => Math.max(a, Math.min(b, x));
+// World-football style Elo: margin-of-victory multiplier, home advantage, last season carried over with 30% regression to the mean
+function eloTable(season, prev) {
+  const ok = (x) => x.score && x.score.fullTime && x.score.fullTime.home != null && x.score.fullTime.away != null;
+  const R = new Map();
+  const get = (id) => (R.has(id) ? R.get(id) : 1500);
+  let draws = 0, total = 0;
+  const run = (games) => {
+    for (const g of [...games].filter(ok).sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate))) {
+      const hs = g.score.fullTime.home, as = g.score.fullTime.away;
+      const hId = g.homeTeam.id, aId = g.awayTeam.id;
+      const rh = get(hId), ra = get(aId);
+      const E = 1 / (1 + Math.pow(10, -(rh + ELO_HA - ra) / 400));
+      const S = hs > as ? 1 : hs === as ? 0.5 : 0;
+      const gd = Math.abs(hs - as);
+      const G = gd <= 1 ? 1 : gd === 2 ? 1.5 : (11 + gd) / 8;
+      const delta = ELO_K * G * (S - E);
+      R.set(hId, rh + delta); R.set(aId, ra - delta);
+      total++; if (hs === as) draws++;
+    }
+  };
+  run(prev);
+  for (const [id, r] of R) R.set(id, 1500 + 0.7 * (r - 1500));
+  run(season);
+  return { R, n: total, drawRate: total >= 30 ? draws / total : 0.26 };
+}
+function eloProbs(tbl, homeId, awayId) {
+  if (!tbl.R.has(homeId) || !tbl.R.has(awayId)) return null;
+  const dr = tbl.R.get(homeId) + ELO_HA - tbl.R.get(awayId);
+  const E = 1 / (1 + Math.pow(10, -dr / 400));
+  const pD = clampN2(tbl.drawRate * Math.exp(-Math.pow(dr / 450, 2)), 0.12, 0.36); // draws are likelier between evenly matched sides
+  let H = Math.max(0.02, E - pD / 2), A = Math.max(0.02, 1 - E - pD / 2);
+  const t = H + pD + A;
+  return { H: H / t, D: pD / t, A: A / t, rH: tbl.R.get(homeId), rA: tbl.R.get(awayId) };
+}
+// Adjusts the goal rates (home/away split, momentum, rest) and blends the 1X2 with Elo and a head-to-head nudge. Every step is shrunk
+// towards "no change" when the sample is small, and the bookmaker market + AI + self-calibration still sit on top in blend().
+async function enhanceForm(form, m, season, prev, hg, ag) {
+  const tech = ['goal model'];
+  let lh = form.lh, la = form.la;
+  const avg = (a, f) => (a.length ? a.reduce((x, g) => x + f(g), 0) / a.length : null);
+  const lg = leagueModel(season);
+  const lgMean = (lg.avgH + lg.avgA) / 2;
+  if (VENUE_ADJ_ON) { // does this team really score more at home / away than its overall average suggests?
+    const hh = hg.filter((g) => g.home), aa = ag.filter((g) => !g.home);
+    let used = false;
+    if (hh.length >= 3 && hg.length >= 6) {
+      const ratio = (avg(hh, (g) => g.gf) / Math.max(0.3, avg(hg, (g) => g.gf))) / (lg.avgH / lgMean);
+      lh *= clampN2(1 + (hh.length / (hh.length + 10)) * (ratio - 1), 0.92, 1.08); used = true;
+    }
+    if (aa.length >= 3 && ag.length >= 6) {
+      const ratio = (avg(aa, (g) => g.gf) / Math.max(0.3, avg(ag, (g) => g.gf))) / (lg.avgA / lgMean);
+      la *= clampN2(1 + (aa.length / (aa.length + 10)) * (ratio - 1), 0.92, 1.08); used = true;
+    }
+    if (used) tech.push('home/away split');
+  }
+  const pts = (g) => (g.gf > g.ga ? 3 : g.gf === g.ga ? 1 : 0);
+  const wppg = (g) => { let w = 0, ws = 0; g.slice(0, 5).forEach((x, i) => { w += (5 - i) * pts(x); ws += 5 - i; }); return ws ? w / ws : null; };
+  const sppg = (g) => (g.length ? g.reduce((x, y) => x + pts(y), 0) / g.length : null);
+  if (MOMENTUM > 0) { // recent form (newest game counts most) against the season-long level
+    let used = false;
+    if (hg.length >= 7) { lh *= clampN2(1 + MOMENTUM * (wppg(hg) - sppg(hg)), 0.95, 1.05); used = true; }
+    if (ag.length >= 7) { la *= clampN2(1 + MOMENTUM * (wppg(ag) - sppg(ag)), 0.95, 1.05); used = true; }
+    if (used) tech.push('momentum');
+  }
+  if (REST_ADJ_ON) { // short rest = tired legs
+    let used = false;
+    if (hg.length && (m.utc - new Date(hg[0].date).getTime()) / 864e5 < 3.5) { lh *= 0.96; used = true; }
+    if (ag.length && (m.utc - new Date(ag[0].date).getTime()) / 864e5 < 3.5) { la *= 0.96; used = true; }
+    if (used) tech.push('rest days');
+  }
+  let probs = poisson1x2(lh, la);
+  const pois = probs;
+  let elo = null;
+  try {
+    const tbl = await cached('elo:' + m.comp + ':' + season.length + ':' + prev.length, CACHE_MS, async () => eloTable(season, prev));
+    elo = eloProbs(tbl, m.homeId, m.awayId);
+  } catch (e) { console.log('Elo failed', m.comp, e.message); }
+  if (elo) {
+    const we = W_ELO * (form.rel == null ? 1 : form.rel);
+    probs = pool2(pois, elo, 1 - we, we);
+    tech.push('Elo');
+  }
+  if (H2H_ADJ_ON) { // tiny nudge from past meetings (this season + last), shrunk hard because samples are small
+    const meet = [...prev, ...season].filter((x) => x.score && x.score.fullTime && x.score.fullTime.home != null &&
+      ((x.homeTeam.id === m.homeId && x.awayTeam.id === m.awayId) || (x.homeTeam.id === m.awayId && x.awayTeam.id === m.homeId)));
+    if (meet.length >= 2) {
+      const gds = meet.map((x) => (x.homeTeam.id === m.homeId ? x.score.fullTime.home - x.score.fullTime.away : x.score.fullTime.away - x.score.fullTime.home));
+      const shift = clampN2(0.012 * (gds.reduce((a, b) => a + b, 0) / gds.length) * (meet.length / (meet.length + 3)), -0.03, 0.03);
+      const H = Math.max(0.02, probs.H + shift), A = Math.max(0.02, probs.A - shift), t = H + probs.D + A;
+      probs = { H: H / t, D: probs.D / t, A: A / t };
+      tech.push('head-to-head');
+    }
+  }
+  return { H: probs.H, D: probs.D, A: probs.A, lh, la, rel: form.rel, poisson: { H: pois.H, D: pois.D, A: pois.A }, elo, tech };
+}
+
 function statAnalysis(m) {
   return cached('stat:' + m.id, CACHE_MS, async () => {
     if (m.extra) return extraAnalysis(m);
@@ -1164,7 +1305,7 @@ function statAnalysis(m) {
       const { lh, la } = expectedGoals(rt, m.homeId, m.awayId);
       // rel: the fewer games we have on either side, the less the goal model is trusted in the blend
       const rel = Math.min(1, (Math.min(hg.length, ag.length) + (prev.length ? 6 : 0)) / 8);
-      form = { ...poisson1x2(lh, la), lh, la, rel };
+      form = await enhanceForm({ ...poisson1x2(lh, la), lh, la, rel }, m, season, prev, hg, ag);
     }
     const h2h = season
       .filter((x) => (x.homeTeam.id === m.homeId && x.awayTeam.id === m.awayId) || (x.homeTeam.id === m.awayId && x.awayTeam.id === m.homeId))
@@ -1172,7 +1313,7 @@ function statAnalysis(m) {
       .slice(0, 3);
     const mkt = m.odds ? m.odds.probs : null;
     const disagree = mkt && form ? 0.5 * ['H', 'D', 'A'].reduce((s, k) => s + Math.abs(mkt[k] - form[k]), 0) : null; // total-variation distance model vs market
-    return { hs: summarise(hg), as: summarise(ag), histH: hg.slice(0, 8), histA: ag.slice(0, 8), form, h2h, mkt, disagree, final: blend(mkt, form, null), ai: null };
+    return { hs: summarise(hg), as: summarise(ag), histH: hg.slice(0, 8), histA: ag.slice(0, 8), form, h2h, mkt, disagree, finalRaw: blendRaw(mkt, form, null), final: blend(mkt, form, null), ai: null };
   });
 }
 
@@ -1186,7 +1327,8 @@ function aiRefine(m, st) {
   if (aiInflight.has(key)) return aiInflight.get(key);
   const p = hfPredict(m, st)
     .then((ai) => {
-      const val = { ...st, ai, final: blend(st.mkt, st.form, ai && ai.probs) };
+      const fr = blendRaw(st.mkt, st.form, ai && ai.probs);
+      const val = { ...st, ai, finalRaw: fr, final: calibrateProbs(fr) };
       if (ai) cache.set(key, { val, exp: Date.now() + CACHE_MS }); // only cache real AI answers
       return val;
     })
@@ -1242,7 +1384,7 @@ async function computeTop5Raw() {
   withStats.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const top = rank(refined).slice(0, 15);
-  top.forEach((x, i) => logPrediction(x.m, x.st, i < 5 ? 'top5' : 'best10'));
+  top.forEach((x, i) => { logPrediction(x.m, x.st, i < 5 ? 'top5' : 'best10'); if (i < 10) logPrediction(x.m, x.st, 'pro10'); });
   return top;
 }
 const computeTop5 = async () => (await computeRanked()).slice(0, 5);
@@ -1370,7 +1512,7 @@ function whyPopular(short, full, prof, tableOk) {
 function pickScore(m, st, minConf = 0) {
   const pick = topPick(m, st.final);
   if (!pick || !m.odds || !pick.odds || pick.odds < MIN_PICK_ODDS || pick.p < minConf) return null;
-  const srcs = [m.odds.probs, st.form, st.ai && st.ai.probs].filter(Boolean);
+  const srcs = [m.odds.probs, st.form, st.ai && st.ai.probs, st.form && st.form.elo].filter(Boolean);
   const agreeN = srcs.filter((x) => argmax(x) === pick.k).length;
   const agree = agreeN / srcs.length;
   const edge = Math.max(-0.04, Math.min(0.04, pick.p - m.odds.probs[pick.k]));
@@ -1408,7 +1550,7 @@ async function computeBest3Raw() {
   pool0.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const list = rank(refined).slice(0, 3);
-  list.forEach((x) => logPrediction(x.m, x.st, 'best3'));
+  list.forEach((x, i) => { logPrediction(x.m, x.st, 'best3'); if (i === 0) logPrediction(x.m, x.st, 'best1'); });
   return { list, skipped, considered: matches.length };
 }
 
@@ -1434,12 +1576,13 @@ async function computeBest3() {
 // Separate from Top 5 / Best 3 / Best 10, which are untouched. For each match we compare 1, 2, 1X, X2, 12, GG and NG and keep the most likely one.
 // 1 / 2 use the real bookmaker price. 1X / X2 / 12 use the fair price from the de-vigged market. GG / NG have no bookmaker feed, so they use model fair odds (1 / p).
 const mktP = (k, o) => (k === 'H' ? o.H : k === 'A' ? o.A : k === 'D' ? o.D : k === '1X' ? o.H + o.D : k === 'X2' ? o.D + o.A : k === '12' ? o.H + o.A : null);
-function marketPick(m, st) {
+function marketPick(m, st, allow) {
   const f = st.final;
   if (!f || !m.odds) return null;
   const mp = m.odds.probs;
   const c = [];
   const add = (k, sign, label, p, odds, fair) => {
+    if (allow && !allow.has(k)) return;
     if (p > 0 && odds && Number.isFinite(odds) && odds >= (fair ? COMBO_MIN_ODDS : MIN_PICK_ODDS)) c.push({ k, sign, label, p, odds, fair });
   };
   add('H', '1', `${m.home} win`, f.H, m.odds.odds.H, false);
@@ -1474,18 +1617,18 @@ const bestPx = (m, p) => (m.odds && m.odds.best && m.odds.best[p.k]) || p.odds;
 function srcLine(m, st, p) {
   if (p.k === 'GG' || p.k === 'NG') return `   📊 Goal-model chance ${pct(p.p)}% · no bookmaker price for this market, so the odds shown are fair odds\n`;
   const v = (src) => pct(mktP(p.k, src));
-  return `   📊 Market ${v(m.odds.probs)}%` + (st.form ? ` · Form ${v(st.form)}%` : '') + (st.ai ? ` · AI ${v(st.ai.probs)}%` : '') + '\n';
+  return `   📊 Market ${v(m.odds.probs)}%` + (st.form ? ` · Form ${v(st.form)}%` : '') + (st.form && st.form.elo ? ` · Elo ${v(st.form.elo)}%` : '') + (st.ai ? ` · AI ${v(st.ai.probs)}%` : '') + '\n';
 }
 
 // Same scoring idea as pickScore, but for the market chosen by marketPick
-function comboScore(m, st, minConf = 0) {
-  const pick = marketPick(m, st);
+function comboScore(m, st, minConf = 0, allow = null) {
+  const pick = marketPick(m, st, allow);
   if (!pick || !m.odds || !pick.odds || pick.p < minConf) return null;
   const goals = pick.k === 'GG' || pick.k === 'NG';
   const single = pick.k === 'H' || pick.k === 'A';
   // a source "supports" the pick when it leans the same way (1/2: same favourite; 1X/X2/12: 60%+; GG/NG: 50%+ from the goal model)
   const supports = (src) => (goals ? (pick.k === 'GG' ? src.btts : 1 - src.btts) >= 0.5 : single ? argmax(src) === pick.k : mktP(pick.k, src) >= 0.6);
-  const srcs = goals ? [st.mk] : [m.odds.probs, st.form, st.ai && st.ai.probs].filter(Boolean);
+  const srcs = goals ? [st.mk] : [m.odds.probs, st.form, st.ai && st.ai.probs, st.form && st.form.elo].filter(Boolean);
   const agreeN = srcs.filter(supports).length;
   const agree = agreeN / srcs.length;
   const ref = goals ? pick.p : mktP(pick.k, m.odds.probs);
@@ -1559,6 +1702,45 @@ async function computeSmart3Raw() {
 }
 const computeSmart3 = () => dayCached('smart3', computeSmart3Raw, (v) => !AI_ON || v.list.some((x) => x.st.ai));
 
+// 7-Day picks. The expensive part (analysis + AI opinion) runs once per day for a candidate pool; the options a user picks
+// (days, picks per day, minimum chance, markets) are applied when the list is rendered, so changing them is instant.
+// Every pick shown is ABOVE the chosen chance; a day with fewer qualifying matches shows fewer picks (the bar is never lowered).
+const WEEK_MARKETS = {
+  a: { label: 'All markets', name: 'all markets', allow: null },
+  d: { label: '🛡 Double chance', name: 'double chance', allow: new Set(['1X', 'X2', '12']) },
+  w: { label: '1️⃣ Win only (1 / 2)', name: 'win only (1 / 2)', allow: new Set(['H', 'A']) },
+  g: { label: '⚽ Goals (GG / NG)', name: 'goals (GG / NG)', allow: new Set(['GG', 'NG']) },
+};
+async function computeWeekRaw() {
+  const now = Date.now();
+  const days = [];
+  for (let d = 0; d < WEEK_DAYS; d++) {
+    const date = localDate(new Date(now + d * 864e5));
+    const ms = (await listForDay(d).catch((e) => { console.log('Week: fixtures failed for day', d, e.message); return []; })).filter((m) => m.odds && m.utc > now);
+    const withStats = (await pool(ms, 3, async (m) => {
+      try { return { m, st: await deepAnalysis(m) }; } catch (e) { return null; }
+    })).filter(Boolean);
+    const rank = (arr, minP, allow = null) => arr
+      .map((x) => ({ ...x, sc: comboScore(x.m, x.st, minP, allow) }))
+      .filter((x) => x.sc && x.sc.pick.p > minP)
+      .sort((a, b) => b.sc.score - a.sc.score);
+    // candidate pool: best overall + best per market family (so "win only" / "double chance" / "goals" views have real choices).
+    // The AI may move a probability by at most AI_MAX_DEV, so the pool is cut a little below the lowest selectable bar.
+    const lo = WEEK_FLOOR - AI_MAX_DEV;
+    const preMap = new Map();
+    for (const [allow, n] of [[null, WEEK_AI_PER_DAY], [WEEK_MARKETS.w.allow, 3], [WEEK_MARKETS.d.allow, 2], [WEEK_MARKETS.g.allow, 2]])
+      for (const x of rank(withStats, lo, allow).slice(0, n)) preMap.set(x.m.id, x);
+    const refined = await pool([...preMap.values()], AI_CONCURRENCY, async (x) => ({ m: x.m, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
+    withStats.forEach((x) => logPrediction(x.m, x.st));
+    refined.forEach((x) => logPrediction(x.m, x.st));
+    const cands = rank(refined, WEEK_FLOOR);
+    cands.filter((x) => x.sc.pick.p > WEEK_MIN_P).slice(0, WEEK_PER_DAY).forEach((x) => logComboPick(x.m, x.st, 'week')); // the default view is what the 'week' stat tracks
+    days.push({ d, date, considered: ms.length, cands });
+  }
+  return days;
+}
+const computeWeek = () => dayCached('week', computeWeekRaw, (v) => v.some((x) => x.cands.length) && (!AI_ON || v.some((x) => x.cands.some((y) => y.st.ai))));
+
 // ---------- Prediction log + self-evaluation (/stats) ----------
 // Every analysed match is stored before kickoff; results are matched later to score each source (Brier / log-loss / accuracy).
 let predLog = [];
@@ -1604,6 +1786,7 @@ async function loadPredLog() {
     } catch {}
   }
   predLog.forEach((r) => predById.set(r.id, r));
+  fitCalibration();
   if (predDirty.size) savePredLog();
 }
 
@@ -1618,6 +1801,7 @@ function logPrediction(m, st, tag) {
   }
   if (r.res) return;
   r.mkt = hda(m.odds.probs); r.form = hda(st.form); r.ai = st.ai ? hda(st.ai.probs) : null; r.final = hda(st.final);
+  r.raw = hda(st.finalRaw || st.final); r.elo = st.form && st.form.elo ? hda(st.form.elo) : null;
   r.odds = hda(m.odds.odds); r.best = hda(m.odds.best); // prices at the time of the pick (for ROI tracking)
   if (tag && !r.tags.includes(tag)) {
     r.tags.push(tag);
@@ -1665,7 +1849,7 @@ async function resolveLog() {
   if (still.length) { // football-data lagging, rate-limited or not covering the league: settle from ESPN / TheSportsDB instead
     try { changed.push(...(await resolveFromFeed(still))); } catch (e) { console.log('Feed settle failed:', e.message); }
   }
-  if (changed.length) savePredLog();
+  if (changed.length) { savePredLog(); fitCalibration(); }
   return changed;
 }
 
@@ -1722,7 +1906,8 @@ async function renderStats() {
     return `• ${name}: ${pct(acc)}% correct · Brier ${br.toFixed(3)} · log-loss ${ll.toFixed(3)} (${r.length})\n`;
   };
   let t = `📊 <b>Model scorecard</b> — ${done.length} finished matches\n<i>Lower Brier / log-loss = better calibrated.</i>\n\n`;
-  t += row('Market odds', 'mkt') + row('Form model', 'form') + row('AI', 'ai') + row('Final blend', 'final');
+  t += row('Market odds', 'mkt') + row('Form model', 'form') + row('Elo model', 'elo') + row('AI', 'ai') + row('Final blend', 'final');
+  t += CAL.T !== 1 ? `🔧 Self-calibration ON: T = ${CAL.T.toFixed(2)} (fitted ${CAL.fitted.toFixed(2)} on ${CAL.n} finished matches)\n` : `🔧 Self-calibration waits for ${CAL_MIN}+ finished matches (have ${CAL.n}).\n`;
 
   // published picks: accuracy + flat-stake ROI
   const picks = done.filter((x) => x.tags && x.tags.length);
@@ -1790,6 +1975,66 @@ async function renderCalibration() {
   }
   return t + '\n' + DISCLAIMER;
 }
+
+// ---------- Per-section track record (Top 5, Best 10, Smart, 7-Day ...) ----------
+// [tag, label, combo?]  combo sections are scored on their own market (1 / 2 / 1X / X2 / 12 / GG / NG), the others on the 1X2 pick.
+const SECTIONS = [
+  ['top5', '🏆 Top 5', false], ['best10', '🔟 Best 10', false], ['pro10', '🔟⭐ Best 10 Pro', false], ['best3', '💎 Best 3', false],
+  ['best1', '🥇 Best 1', false], ['vip', '👑 VIP Special', false],
+  ['smart10', '🎯 Smart 10', true], ['smart5', '🎯 Smart 5', true], ['smart3', '🎯 Smart 3', true], ['week', '📅 7-Day picks', true],
+];
+const SECTION_LABEL = Object.fromEntries(SECTIONS.map(([k, l]) => [k, l]));
+function sectionRows(tag, days = 0) {
+  const combo = (SECTIONS.find((x) => x[0] === tag) || [])[2];
+  const since = days ? Date.now() - days * 864e5 : 0;
+  const o = { n: 0, won: 0, pending: 0, priced: 0, profit: 0, conf: 0 };
+  for (const r of predLog) {
+    if (!r.tags || !r.tags.includes(tag) || r.utc < since) continue;
+    let k, p, odds;
+    if (combo) { if (!r.cpick) continue; k = r.cpick; p = r.cp; odds = r.codds; }
+    else { if (!r.final) continue; k = r.pubPick || argmax(r.final); p = r.final[k]; odds = r.pubOdds ? r.pubOdds[k] : r.odds ? r.odds[k] : null; }
+    if (!r.res) { o.pending++; continue; }
+    const w = combo ? pickWon(k, r) : k === r.res;
+    if (w == null) continue;
+    o.n++; if (w) o.won++; o.conf += p || 0;
+    if (odds) { o.priced++; o.profit += w ? odds - 1 : -1; }
+  }
+  return { ...o, rate: o.n ? o.won / o.n : null, avgConf: o.n ? o.conf / o.n : null, roi: o.priced ? o.profit / o.priced : null };
+}
+const sectionTxt = (s) => (s.n
+  ? `${s.won}/${s.n} won (${pct(s.rate)}%) · avg confidence ${pct(s.avgConf)}%` + (s.priced >= 5 ? ` · ROI ${signed(s.roi * 100)}%` : '') + (s.pending ? ` · ${s.pending} pending` : '')
+  : s.pending ? `${s.pending} pending, none settled yet` : 'no settled picks yet');
+function sectionLine(tag, days = 30) { // one-line record appended to every section's output
+  const s = sectionRows(tag, days);
+  const lab = SECTION_LABEL[tag] || tag;
+  if (s.n < 5) return `📊 <i>${lab} record (last ${days} days): still building — ${s.n} settled${s.pending ? `, ${s.pending} pending` : ''}.</i>\n\n`;
+  return `📊 <b>${lab} record · last ${days} days:</b> ${sectionTxt(s)}\n\n`;
+}
+async function renderSections() {
+  await resolveLog();
+  let tx = '📈 <b>Section stats</b>\n━━━━━━━━━━━━━━\n<i>Won / settled picks for every section. 1X2 sections are scored on the pick\'s 90-minute result; Smart and 7-Day on their own market. Compare the average confidence the bot claimed with the real win rate — they should be close.</i>\n\n';
+  for (const [tag, label] of SECTIONS) tx += `<b>${label}</b>\n   30 days: ${sectionTxt(sectionRows(tag, 30))}\n   All time: ${sectionTxt(sectionRows(tag, 0))}\n`;
+  const seen = new Set(), byK = new Map();
+  for (const r of predLog) {
+    if (!r.res || !r.cpick || !r.tags || seen.has(r.id) || !SECTIONS.some(([t2, , c]) => c && r.tags.includes(t2))) continue;
+    seen.add(r.id);
+    const w = pickWon(r.cpick, r);
+    if (w == null) continue;
+    const e = byK.get(r.cpick) || { n: 0, w: 0, c: 0 };
+    e.n++; if (w) e.w++; e.c += r.cp || 0; byK.set(r.cpick, e);
+  }
+  if (byK.size) {
+    const sign = { H: '1', A: '2' };
+    tx += '\n🧩 <b>Combo picks by market</b> (Smart + 7-Day)\n';
+    for (const k of ['H', 'A', '1X', 'X2', '12', 'GG', 'NG']) { const e = byK.get(k); if (e) tx += `   ${sign[k] || k}: ${e.w}/${e.n} (${pct(e.w / e.n)}%) · avg confidence ${pct(e.c / e.n)}%\n`; }
+  }
+  tx += CAL.T !== 1 ? `\n🔧 Self-calibration is ON (T = ${CAL.T.toFixed(2)}, ${CAL.n} finished matches) — probabilities are stretched or squeezed to match your real results.` : `\n🔧 Self-calibration switches on after ${CAL_MIN} finished matches (have ${CAL.n}).`;
+  return tx + '\n\n' + DISCLAIMER;
+}
+const secH = async (ctx) => {
+  try { await ctx.sendChatAction('typing').catch(() => {}); await replyLong(ctx, await renderSections(), navKb()); }
+  catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
+};
 
 // ---------- Message builders ----------
 const DISCLAIMER =
@@ -1925,12 +2170,12 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
   '<b>📋 All commands</b>\n' +
-  '\n🔥 <b>Picks</b>\n/picks · /best10 · /top5 · /best3 · /best1 · /best10pro · /potw · /vip\n/smart10 · /smart5 · /smart3\n' +
-  '\n⚽ <b>Matches</b>\n/today · /live · /table · /predict\n' +
+  '\n🔥 <b>Picks</b>\n/picks · /best10 · /top5 · /best3 · /best1 · /best10pro · /potw · /vip · /week\n/smart10 · /smart5 · /smart3\n/week [days] [per day] [min %] [dc|win|goals]\n' +
+  '\n⚽ <b>Matches</b>\n/today · /live · /table · /predict · /matches\n' +
   '\n📈 <b>Markets</b> <i>(Premium)</i>\n/markets · /value · /goals · /dc · /scores\n/result · /htft · /combos · /handicaps · /market\n' +
   '\n🎯 <b>Accumulators</b> <i>(Premium)</i>\n/accas · /acca · /safe · /weekend\n' +
   '\n👤 <b>My zone</b>\n/myzone · /myrecord · /leaders · /watchlist · /subscribe · /stake\n/refer · /redeem · /account · /settings · /lang\n' +
-  '\n📊 <b>Track record</b>\n/stats · /history · /calibration\n' +
+  '\n📊 <b>Track record</b>\n/stats · /history · /calibration · /sections\n' +
   '\n💎 /premium · 🛡 /responsible · ❓ /help · 🏠 /menu';
 const TX = {
   en: {
@@ -2031,7 +2276,7 @@ const hasPremium = (u) => isAdminId(u.id) || (u.plan_until && new Date(u.plan_un
 // Each Premium feature can be made free (or locked again) by an admin at any time. The choice is stored in the DB.
 const FEATURES = {
   top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1', best10pro: '🔟⭐ Best 10 Pro', potw: '🌟 Pick of the Week',
-  weekend: '🏖 Weekend special', vip: '👑 VIP Special', smart5: '🎯 Smart 5', smart3: '🎯 Smart 3', value: '📈 Value bets',
+  weekend: '🏖 Weekend special', vip: '👑 VIP Special', week: '📅 7-Day picks', smart5: '🎯 Smart 5', smart3: '🎯 Smart 3', value: '📈 Value bets',
   goals: '⚽ Goals markets', dc: '🛡 Double chance', safe: '🛡 Safe slip', scores: '🎯 Correct score', acca: '🎯 Accumulators',
   markets: '📋 All markets', watchlist: '⭐ Watchlist', daily: '🔔 Daily picks push', analysis: '🔍 Unlimited analyses',
 };
@@ -2046,13 +2291,13 @@ async function loadFree() {
 }
 const saveFree = () => q(`INSERT INTO settings (key, value) VALUES ('free_features', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify([...FREE_FEATURES])]);
 const CMD_FEATURE = {
-  top5: 'top5', best3: 'best3', best1: 'best1', best10pro: 'best10pro', potw: 'potw', weekend: 'weekend', safe: 'safe', scores: 'scores', vip: 'vip',
+  top5: 'top5', best3: 'best3', best1: 'best1', best10pro: 'best10pro', potw: 'potw', weekend: 'weekend', week: 'week', weekly: 'week', safe: 'safe', scores: 'scores', vip: 'vip',
   smart5: 'smart5', smart3: 'smart3', value: 'value', goals: 'goals', dc: 'dc', acca: 'acca', watchlist: 'watchlist', subscribe: 'daily',
   result: 'markets', htft: 'markets', combos: 'markets', handicaps: 'markets', market: 'markets', predict: 'analysis',
 };
 const CB_FEATURE = [
-  [/^(top5|best3|best1|best10pro|potw|weekend|safe|scores|vip|smart5|smart3|value|goals|dc)$/, (m) => m[1]],
-  [/^acca(:|$)/, 'acca'], [/^(mk:|am:|mkhelp)/, 'markets'], [/^w:/, 'watchlist'], [/^set:sub$/, 'daily'], [/^m:\d+:\d+$/, 'analysis'],
+  [/^(top5|best3|best1|best10pro|potw|weekend|week|safe|scores|vip|smart5|smart3|value|goals|dc)$/, (m) => m[1]],
+  [/^acca(:|$)/, 'acca'], [/^wk(set)?:/, 'week'], [/^(mk:|am:|mkhelp)/, 'markets'], [/^w:/, 'watchlist'], [/^set:sub$/, 'daily'], [/^m:\d+:\d+$/, 'analysis'],
 ];
 const MENU_FEATURE = { '🏆 Top 5': 'top5', '💎 Best 3': 'best3', '📈 Value': 'value', '🎯 Acca': 'acca', '⭐ Watchlist': 'watchlist' };
 function cbFeature(d) {
@@ -2431,7 +2676,7 @@ async function renderTop5(u, { full = true } = {}) {
   });
   let kb = null;
   if (shown.length < top.length) { tx += `🔒 ${t(u, 'locked_more', top.length - shown.length)}\n\n`; kb = upgradeKb(u); }
-  return { text: tx + t(u, 'disc'), kb: followKb(shown, kb), empty: false };
+  return { text: tx + sectionLine('top5') + t(u, 'disc'), kb: followKb(shown, kb), empty: false };
 }
 
 async function renderBest10(u) {
@@ -2447,7 +2692,7 @@ async function renderBest10(u) {
     if (r) tx += `   <i>${esc(r)}</i>\n`;
     tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
   });
-  return { text: tx + t(u, 'disc'), kb: followKb(list, u && hasPremium(u) ? null : quickBuyKb()), empty: false };
+  return { text: tx + sectionLine('best10') + t(u, 'disc'), kb: followKb(list, u && hasPremium(u) ? null : quickBuyKb()), empty: false };
 }
 
 async function renderBest3(u, { full = true, only1 = false } = {}) {
@@ -2486,7 +2731,7 @@ async function renderBest3(u, { full = true, only1 = false } = {}) {
   });
   let kb = null;
   if (!only1 && shown.length < list.length) { tx += `🔒 ${t(u, 'locked_more', list.length - shown.length)}\n\n`; kb = upgradeKb(u); }
-  return { text: tx + t(u, 'disc'), kb: followKb(shown, kb), empty: false };
+  return { text: tx + sectionLine(only1 ? 'best1' : 'best3') + t(u, 'disc'), kb: followKb(shown, kb), empty: false };
 }
 
 // ----- Value bets: model probability vs the BEST bookmaker price -----
@@ -2524,7 +2769,104 @@ async function renderSmart(u, kind) {
   const fb = list.map((x, i) => Markup.button.callback(`📌 ${i + 1}`, `fc:${x.m.id}`));
   for (let i = 0; i < fb.length; i += 5) rows.push(fb.slice(i, i + 5));
   rows.push(Object.keys(SMART).filter((x) => x !== kind).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(u) && !isFree(x) ? '🔒 ' : '') + SMART[x][0], x)));
-  return { text: tx + t(u, 'disc'), kb: Markup.inlineKeyboard(rows) };
+  return { text: tx + sectionLine(kind) + t(u, 'disc'), kb: Markup.inlineKeyboard(rows) };
+}
+
+const clampOpt = (x, a, b, dflt) => { x = Number(x); return Number.isFinite(x) ? Math.max(a, Math.min(b, Math.round(x))) : dflt; };
+const weekOpts = (o = {}) => ({
+  days: clampOpt(o.days, 1, WEEK_DAYS, WEEK_DAYS),
+  per: clampOpt(o.per, 1, 5, WEEK_PER_DAY),
+  min: clampOpt(o.min, Math.round(WEEK_FLOOR * 100), 90, Math.round(WEEK_MIN_P * 100)),
+  mk: WEEK_MARKETS[o.mk] ? o.mk : 'a',
+});
+const weekKey = (o) => `${o.days}:${o.per}:${o.min}:${o.mk}`;
+function parseWeekArgs(text) { // /week 5 3 75 dc  ->  5 days, 3 per day, above 75%, double chance only
+  const o = {}, small = [];
+  for (const w of String(text || '').toLowerCase().split(/\s+/).filter(Boolean)) {
+    const raw = w.replace('%', '');
+    const n = Number(raw);
+    if (raw !== '' && Number.isFinite(n)) { if (n >= 50 || w.includes('%')) o.min = n; else small.push(n); }
+    else if (/^(dc|double|doublechance)$/.test(w)) o.mk = 'd';
+    else if (/^(win|wins|1x2|result)$/.test(w)) o.mk = 'w';
+    else if (/^(goals|gg|ng|btts)$/.test(w)) o.mk = 'g';
+    else if (w === 'all') o.mk = 'a';
+  }
+  if (small.length) o.days = small[0];
+  if (small.length > 1) o.per = small[1];
+  return weekOpts(o);
+}
+const weekTech = () => 'bookmaker odds (margin removed, sharp books weighted) · Dixon-Coles goal model · Elo ratings · home/away split · form momentum · rest days · head-to-head' + (AI_ON ? ' · AI opinion' : '') + ' · self-calibration on logged results';
+// every market a user can follow must be known to the follow handler (cpick = the default; anything else is stored in r.alt)
+function registerAlt(m, p) {
+  const r = predById.get(m.id);
+  if (!r || r.res || p.k === r.cpick) return;
+  r.alt = r.alt || {};
+  r.alt[p.k] = { label: p.label, p: p.p, odds: p.fair ? Math.max(1.01, +(p.odds * (1 - COMBO_MARGIN)).toFixed(2)) : p.odds };
+  predDirty.add(r.id); savePredLog();
+}
+function weekPanel(oIn) {
+  const o = weekOpts(oIn);
+  const B = Markup.button.callback;
+  const key = (patch) => `wkset:${weekKey(weekOpts({ ...o, ...patch }))}`;
+  const mark = (on, label) => (on ? '✅ ' : '') + label;
+  return {
+    text: `⚙️ <b>Customise 7-Day picks</b>\n━━━━━━━━━━━━━━\n📆 Days: <b>${o.days}</b> · 🎟 Picks per day: <b>${o.per}</b> · 🎯 Chance above: <b>${o.min}%</b>\n🧩 Markets: <b>${esc(WEEK_MARKETS[o.mk].label)}</b>\n\n<i>A higher bar means fewer but safer picks; a lower bar fills more slots but loses more often. Tap to change, then press Show picks.</i>`,
+    kb: Markup.inlineKeyboard([
+      [3, 5, 7].filter((n) => n <= WEEK_DAYS).map((n) => B(mark(o.days === n, `${n} days`), key({ days: n }))),
+      [1, 2, 3, 5].map((n) => B(mark(o.per === n, `${n}/day`), key({ per: n }))),
+      [60, 65, 70, 75, 80].map((n) => B(mark(o.min === n, `${n}%`), key({ min: n }))),
+      [B(mark(o.mk === 'a', 'All markets'), key({ mk: 'a' })), B(mark(o.mk === 'd', '🛡 Double chance'), key({ mk: 'd' }))],
+      [B(mark(o.mk === 'w', '1 / 2 only'), key({ mk: 'w' })), B(mark(o.mk === 'g', '⚽ GG / NG'), key({ mk: 'g' }))],
+      [B('✅ Show picks', `wk:${weekKey(o)}`)],
+      [B('⬅️ Menu', 'menu')],
+    ]),
+  };
+}
+async function renderWeek(u, oIn) {
+  const o = weekOpts(oIn);
+  const minP = o.min / 100, allow = WEEK_MARKETS[o.mk].allow;
+  const B = Markup.button.callback;
+  const days = (await computeWeek()).slice(0, o.days);
+  const upcoming = (x) => x.m.utc > Date.now();
+  const custom = [[B('⚙️ Customise', `wkset:${weekKey(o)}`), B('📈 Section stats', 'sec')]];
+  let tx = `📅 <b>${o.days}-Day picks</b> — up to ${o.per} per day · each above ${o.min}% · ${esc(WEEK_MARKETS[o.mk].label)}\n<i>Analysis: ${weekTech()}.</i>\n\n${MARKET_HINT}${FOLLOW_HINT}`;
+  if (o.min < 65) tx += `⚠️ <i>A bar under 65% means more picks but they lose often.</i>\n\n`;
+  let n = 0, probSum = 0, probAll = 1;
+  const shown = [];
+  for (const day of days) {
+    const list = applyPrefs(day.cands.filter(upcoming)
+      .map((x) => ({ ...x, sc: comboScore(x.m, x.st, minP, allow) }))
+      .filter((x) => x.sc && x.sc.pick.p > minP)
+      .sort((a, b) => b.sc.score - a.sc.score), u).slice(0, o.per);
+    tx += `🗓 <b>${esc(dayName(day.d))}</b>\n`;
+    if (!list.length) {
+      tx += day.considered
+        ? `   😴 No match above ${o.min}% for ${esc(WEEK_MARKETS[o.mk].name)} with usable odds — I won't lower the bar.\n\n`
+        : `   😴 No odds posted yet for this day (bookmakers add them closer to match day).\n\n`;
+      continue;
+    }
+    for (const { m, st, sc } of list) {
+      const p = sc.pick;
+      n++; probSum += p.p; probAll *= p.p; shown.push({ m, k: p.k }); registerAlt(m, p);
+      tx += `${n}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+      tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
+      tx += srcLine(m, st, p);
+      if (st.mk && st.form) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
+      if (st.form && st.form.tech && st.form.tech.length > 1) tx += `   🔬 ${esc(st.form.tech.join(' + '))}\n`;
+      const r = reasonOf(m, st);
+      if (r) tx += `   <i>${esc(r)}</i>\n`;
+      tx += stakeTxt(u, p.p, bestPx(m, p)) + '\n';
+    }
+    tx += '\n';
+  }
+  if (!n) return { text: `😴 No pick above ${o.min}% (${WEEK_MARKETS[o.mk].name}) with usable odds for the next ${o.days} day${o.days > 1 ? 's' : ''} right now. Odds for later days usually appear closer to match day, so check again later, or tap Customise to change the bar or the markets.\n\n` + t(u, 'disc'), kb: Markup.inlineKeyboard(custom) };
+  tx += `📦 <b>${n} picks</b> · average confidence <b>${pct(probSum / n)}%</b> · chance that ALL of them win ≈ <b>${(probAll * 100).toFixed(probAll < 0.1 ? 1 : 0)}%</b>\n`;
+  tx += `<i>⚠️ ${o.min}%+ is the model's estimate, not a guarantee — a 70% pick still loses about 3 times in 10, and several together lose more often than they win. Stake only what you can afford to lose.</i>\n\n`;
+  const rows = [];
+  const fb = shown.map(({ m, k }, i) => B(`📌 ${i + 1}`, `fc:${m.id}:${k}`));
+  for (let i = 0; i < fb.length; i += 5) rows.push(fb.slice(i, i + 5));
+  rows.push(...custom);
+  return { text: tx + sectionLine('week') + t(u, 'disc'), kb: Markup.inlineKeyboard(rows) };
 }
 
 function computeValue() {
@@ -3178,7 +3520,7 @@ async function renderBest10Pro(u) {
     if (r) tx += `   <i>${esc(r)}</i>\n`;
     tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
   });
-  return { text: tx + t(u, 'disc'), kb: followKb(list, null) };
+  return { text: tx + sectionLine('pro10') + t(u, 'disc'), kb: followKb(list, null) };
 }
 
 
@@ -3195,6 +3537,7 @@ async function renderVip(u) {
   let tx = '👑 <b>VIP Special — most likely winners today</b>\n<i>The matches where one side has the highest win probability across bookmaker odds, the goals model and AI.</i>\n';
   if (!strong.length) tx += `<i>No match reaches ${pct(VIP_MIN_P)}% today — these are the strongest available.</i>\n`;
   tx += '\n' + FOLLOW_HINT;
+  list.forEach((x) => logPrediction(x.m, x.st, 'vip'));
   list.forEach(({ m, st, sc }, i) => {
     const p = sc.pick, k = p.k;
     tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
@@ -3205,7 +3548,7 @@ async function renderVip(u) {
     tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[k] : p.odds) + '\n';
   });
   tx += '<i>A high % means more likely, not certain — favourites still lose.</i>\n';
-  return { text: tx + t(u, 'disc'), kb: followKb(list, null) };
+  return { text: tx + sectionLine('vip') + t(u, 'disc'), kb: followKb(list, null) };
 }
 
 // ----- Safe slip (Premium): safest combination of 1-3 picks that reaches the target combined odds -----
@@ -3352,34 +3695,46 @@ function mainText(u) {
   return `⚽ <b>Football Predictions</b>\n━━━━━━━━━━━━━━\n👋 ${esc(u.first_name || 'there')} · ${plan}\n📅 ${today}\n\nChoose a section 👇`;
 }
 const mainKb = (u) => Markup.inlineKeyboard([
-  [Markup.button.callback('🔥 Daily Picks', 'hub:picks'), Markup.button.callback('⚽ Matches Today', 'today')],
+  [Markup.button.callback('🔥 Daily Picks', 'hub:picks'), Markup.button.callback('⚽ Matches', 'hub:matches')],
   [Markup.button.callback('📈 Markets', 'hub:markets'), Markup.button.callback('🎯 Accumulators', 'hub:acca')],
-  [Markup.button.callback('🔴 Live Scores', 'live'), Markup.button.callback('📊 Tables', 'tbl')],
-  [Markup.button.callback('👤 My Zone', 'hub:me'), Markup.button.callback('⚙️ Settings', 'st')],
-  [Markup.button.callback(hasPremium(u) ? '💎 My Premium' : '💎 Go Premium', 'up'), Markup.button.callback('🛡 Responsible', 'resp'), Markup.button.callback('❓ Help', 'help')],
+  [Markup.button.callback('👤 My Zone', 'hub:me'), Markup.button.callback('⚙️ Settings & Help', 'hub:more')],
+  [Markup.button.callback(hasPremium(u) ? '💎 My Premium' : '💎 Go Premium', 'up')],
   ...(isAdminId(u.id) ? [[Markup.button.callback('🛡 Admin panel', 'adm:open')]] : []),
 ]);
 const LBTN = (u, label, data, prem = true) => Markup.button.callback((prem && !hasPremium(u) && !dataFree(data) ? '🔒 ' : '') + label, data);
 function hubView(name, u) {
-  const back = [Markup.button.callback('⬅️ Menu', 'menu')];
-  const free = hasPremium(u) ? '' : '\n<i>🔒 = Premium. Tap one to preview it.</i>';
+  const B = Markup.button.callback;
+  const back = [B('⬅️ Menu', 'menu')];
+  const lock = hasPremium(u) ? '' : '\n\n<i>🔒 = Premium. Tap one to preview it.</i>';
+  const head = (title) => `${title}\n━━━━━━━━━━━━━━\nChoose one 👇`;
   if (name === 'picks') {
     const proof = proofLine();
     return {
-      text: '🔥 <b>Daily Picks</b>\n━━━━━━━━━━━━━━\n🔟 <b>Best 10</b> — free ranked picks\n🏆 <b>Top 5</b> — the sharpest picks of the day\n💎 <b>Best 3</b> — under-the-radar picks\n🥇 <b>Best 1</b> — the single best pick\n🔟⭐ <b>Best 10 Pro</b> — top 10 with confidence tiers\n🌟 <b>Pick of the Week</b>\n🎯 <b>Smart 10 / 5 / 3</b> — most likely market per match (1 · 2 · 1X · X2 · 12 · GG · NG)' + (proof ? `\n\n${proof}` : '') + free,
+      text: head('🔥 <b>Daily Picks</b>') + (proof ? `\n\n${proof}` : '') + lock,
       kb: Markup.inlineKeyboard([
         [LBTN(u, '🔟 Best 10 · Free', 'best10', false), LBTN(u, '🏆 Top 5', 'top5')],
         [LBTN(u, '💎 Best 3', 'best3'), LBTN(u, '🥇 Best 1', 'best1')],
         [LBTN(u, '🔟⭐ Best 10 Pro', 'best10pro'), LBTN(u, '🌟 Pick of the Week', 'potw')],
-        [LBTN(u, '👑 VIP Special', 'vip')],
+        [LBTN(u, '📅 7-Day Picks', 'week'), LBTN(u, '👑 VIP Special', 'vip')],
         [LBTN(u, '🎯 Smart 10 · Free', 'smart10', false), LBTN(u, '🎯 Smart 5', 'smart5'), LBTN(u, '🎯 Smart 3', 'smart3')],
+        [B('📊 Section stats', 'sec')],
+        back,
+      ]),
+    };
+  }
+  if (name === 'matches') {
+    return {
+      text: head('⚽ <b>Matches</b>'),
+      kb: Markup.inlineKeyboard([
+        [B('⚽ Today', 'today'), B('📅 Tomorrow', 'pd:1:0')],
+        [B('🔴 Live Scores', 'live'), B('📊 Tables', 'tbl')],
         back,
       ]),
     };
   }
   if (name === 'markets') {
     return {
-      text: '📈 <b>Markets</b>\n━━━━━━━━━━━━━━\n📈 <b>Value bets</b> — model beats the best bookie price\n🏁 <b>Result</b> — 1X2, Double Chance, Draw No Bet\n⚽ <b>Goals</b> — GG/NG, Over/Under 0.5–3.5, team goals, multi-goals\n⏱ <b>HT/FT</b> — HT/FT, HT, 2HT, win either half, score both halves\n🧩 <b>Combos</b> — 1 &amp; GG, 1 &amp; OV 2.5, 1X &amp; UN 3.5…\n📐 <b>Handicaps</b> — 1 (-1), 2 (+1), Asian handicap\n🛡 <b>Double chance</b> — safer 1X / X2 / DNB picks\n🎯 <b>Correct score</b> — likeliest scorelines\n📋 <b>Any match</b> — every market for one game (also corners &amp; cards)' + free,
+      text: head('📈 <b>Markets</b>') + lock,
       kb: Markup.inlineKeyboard([
         [LBTN(u, '📈 Value bets', 'value'), LBTN(u, '🏁 Result', 'mk:res')],
         [LBTN(u, '⚽ Goals', 'mk:goals'), LBTN(u, '⏱ HT/FT', 'mk:htft')],
@@ -3392,17 +3747,28 @@ function hubView(name, u) {
   }
   if (name === 'acca') {
     return {
-      text: '🎯 <b>Accumulators</b>\n━━━━━━━━━━━━━━\n🎯 <b>Acca builder</b> — safe / balanced / risky, 2–6 legs\n🛡 <b>Safe slip</b> — safest combo reaching ' + SAFE_TARGET_ODDS.toFixed(1) + ' odds\n🏖 <b>Weekend special</b> — 4-leg slip on Fri–Sun' + free,
+      text: head('🎯 <b>Accumulators</b>') + lock,
       kb: Markup.inlineKeyboard([[LBTN(u, '🎯 Acca builder', 'acca:balanced:3'), LBTN(u, '🛡 Safe slip', 'safe')], [LBTN(u, '🏖 Weekend special', 'weekend')], back]),
     };
   }
+  if (name === 'more') {
+    return {
+      text: head('⚙️ <b>Settings &amp; Help</b>'),
+      kb: Markup.inlineKeyboard([
+        [B('⚙️ Settings', 'st'), B('👤 Account', 'acct')],
+        [B('🛡 Responsible play', 'resp'), B('❓ Help', 'help')],
+        [B('📋 All commands', 'cmds')],
+        back,
+      ]),
+    };
+  }
   return {
-    text: '👤 <b>My Zone</b>\n━━━━━━━━━━━━━━\n📌 <b>My record</b> — your followed picks and win rate\n🏅 <b>Leaderboard</b> — top followers this month\n⭐ <b>Watchlist</b> — kickoff alerts and results\n🎁 <b>Refer &amp; earn</b> — free Premium days\n🎟 <b>Redeem code</b> — promo codes\n📊 <b>Track record</b> — how the model is doing',
+    text: head('👤 <b>My Zone</b>'),
     kb: Markup.inlineKeyboard([
-      [Markup.button.callback('📌 My record', 'myrec'), Markup.button.callback('🏅 Leaderboard', 'leaders')],
-      [LBTN(u, '⭐ Watchlist', 'wl'), Markup.button.callback('🎁 Refer & earn', 'refer')],
-      [Markup.button.callback('🎟 Redeem code', 'redeem'), Markup.button.callback('👤 Account', 'acct')],
-      [Markup.button.callback('📊 Track record', 'trk'), Markup.button.callback('⚙️ Settings', 'st')],
+      [B('📌 My record', 'myrec'), B('🏅 Leaderboard', 'leaders')],
+      [LBTN(u, '⭐ Watchlist', 'wl'), B('🎁 Refer & earn', 'refer')],
+      [B('🎟 Redeem code', 'redeem'), B('📊 Track record', 'trk')],
+      [B('📈 Section stats', 'sec')],
       back,
     ]),
   };
@@ -3659,9 +4025,9 @@ const MENU_BTN = Markup.button.callback('🏠 Menu', 'menu');
 const withNav = (kb, rows = []) => Markup.inlineKeyboard([...((kb && kb.reply_markup && kb.reply_markup.inline_keyboard) || []), ...rows, [MENU_BTN]]);
 const navKb = (rows = []) => withNav(null, rows);
 const replyMenu = Markup.keyboard([
-  ['🔥 Picks', '⚽ Today', '🔴 Live'],
-  ['📈 Markets', '🎯 Accas', '👤 My Zone'],
-  ['💎 Premium', '🛡 Responsible', '🏠 Menu'],
+  ['🔥 Picks', '⚽ Matches', '📈 Markets'],
+  ['🎯 Accas', '👤 My Zone', '💎 Premium'],
+  ['🏠 Menu'],
 ]).resize();
 if (replyMenu.reply_markup) { replyMenu.reply_markup.is_persistent = true; replyMenu.reply_markup.input_field_placeholder = 'Pick an option…'; }
 const showToday = async (ctx) => {
@@ -3671,6 +4037,7 @@ const showToday = async (ctx) => {
 };
 const MENU_ACTIONS = {
   '🔥 Picks': (ctx) => showHub('picks')(ctx),
+  '⚽ Matches': (ctx) => showHub('matches')(ctx),
   '📈 Markets': (ctx) => showHub('markets')(ctx),
   '🎯 Accas': (ctx) => showHub('acca')(ctx),
   '👤 My Zone': (ctx) => showHub('me')(ctx),
@@ -3719,9 +4086,14 @@ const helpH = (ctx) => {
       'Best 3 = same blend, but only matches where neither team is a big-name club or in the top ' + TOP_RANK_EXCLUDE + ' of its table.\n' +
       'Best 10 (free) = the next-ranked picks after the Premium Top 5. Best 10 Pro = the 10 top-ranked picks with confidence tiers. Safe slip = the most likely combination reaching ' + SAFE_TARGET_ODDS.toFixed(1) + ' total odds.\n' +
       'Value = model probability beats the best bookmaker price by a margin. Acca = picks combined from today\'s best matches.\n\n' +
-      CMD_LIST + '\n\n' + t(ctx.u, 'disc'), navKb());
+      t(ctx.u, 'disc'),
+    navKb([
+      [Markup.button.callback('🔥 Picks', 'hub:picks'), Markup.button.callback('⚽ Matches', 'hub:matches'), Markup.button.callback('📈 Markets', 'hub:markets')],
+      [Markup.button.callback('🎯 Accas', 'hub:acca'), Markup.button.callback('👤 My Zone', 'hub:me'), Markup.button.callback('📋 All commands', 'cmds')],
+    ]));
 };
 bot.help(helpH);
+bot.action('cmds', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); await reply(ctx, CMD_LIST, navKb()); });
 
 bot.command('today', async (ctx) => {
   await ctx.sendChatAction('typing');
@@ -3819,20 +4191,53 @@ for (const kind of Object.keys(SMART)) {
     h(ctx).catch(console.error);
   });
 }
-const smartMenu = (ctx) => reply(ctx, '🎯 <b>Smart picks</b>\n━━━━━━━━━━━━━━\nFor every match I compare <b>1 · 2 · 1X · X2 · 12 · GG · NG</b> and give you the most likely one.\n\n🎯🔟 <b>Smart 10</b> — free\n🎯🏆 <b>Smart 5</b> — Premium\n🎯💎 <b>Smart 3</b> — under-the-radar, Premium' + (hasPremium(ctx.u) ? '' : '\n\n<i>🔒 = Premium.</i>'),
+const smartMenu = (ctx) => reply(ctx, '🎯 <b>Smart picks</b>\n━━━━━━━━━━━━━━\nChoose one 👇' + (hasPremium(ctx.u) ? '' : '\n\n<i>🔒 = Premium.</i>'),
   withNav(null, [Object.keys(SMART).map((x) => Markup.button.callback((SMART[x][1] && !hasPremium(ctx.u) && !isFree(x) ? '🔒 ' : '') + SMART[x][0], x))]));
 bot.command('smart', detach(smartMenu));
 bot.action('smart', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); smartMenu(ctx).catch(console.error); });
-bot.action(/^fc:(\d+)$/, async (ctx) => { // follow a Smart pick (settled on its own market: 1X, X2, 12, GG, NG ...)
+// ----- 7-Day picks: /week [days] [per day] [min %] [dc|win|goals|all]  (Premium) -----
+const weekH = (oIn) => async (ctx) => {
+  const o = weekOpts(oIn);
+  const wait = await ctx.reply(`📅 Scanning the next ${o.days} day${o.days > 1 ? 's' : ''} for ${o.min}%+ picks… the first run can take a few minutes.`);
+  try {
+    await ctx.sendChatAction('typing').catch(() => {});
+    const r = await renderWeek(ctx.u, o);
+    await ctx.telegram.deleteMessage(ctx.chat.id, wait.message_id).catch(() => {});
+    await replyLong(ctx, r.text, withNav(r.kb));
+  } catch (e) { console.error(e); await ctx.reply(t(ctx.u, 'fail')); }
+};
+const WEEK_LOCK = '🔒 <b>📅 7-Day picks</b> is a Premium feature.';
+for (const c of ['week', 'weekly']) bot.command(c, (ctx) => (ctx.premium ? detach(weekH(parseWeekArgs(argText(ctx))))(ctx) : paywall(ctx, WEEK_LOCK)));
+bot.action('week', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.premium) return paywall(ctx, WEEK_LOCK);
+  weekH({})(ctx).catch(console.error);
+});
+bot.action(/^wk:(\d):(\d):(\d+):([adwg])$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.premium) return paywall(ctx, WEEK_LOCK);
+  weekH({ days: ctx.match[1], per: ctx.match[2], min: ctx.match[3], mk: ctx.match[4] })(ctx).catch(console.error);
+});
+bot.action(/^wkset:(\d):(\d):(\d+):([adwg])$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.premium) return paywall(ctx, WEEK_LOCK);
+  const v = weekPanel({ days: ctx.match[1], per: ctx.match[2], min: ctx.match[3], mk: ctx.match[4] });
+  await editOrReply(ctx, v.text, v.kb);
+});
+bot.command(['sections', 'sectionstats'], detach(secH));
+bot.action('sec', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); secH(ctx).catch(console.error); });
+bot.action(/^fc:(\d+)(?::(H|A|1X|X2|12|GG|NG))?$/, async (ctx) => { // follow a Smart / 7-Day pick (settled on its own market: 1X, X2, 12, GG, NG ...)
   const id = Number(ctx.match[1]);
   const r = predById.get(id);
   if (!r || !r.final || r.utc <= Date.now()) return ctx.answerCbQuery('This match has started — it can no longer be followed.', { show_alert: true });
-  if (!r.cpick) return ctx.answerCbQuery('This smart pick is not available to follow.', { show_alert: true });
+  const fk = ctx.match[2] || r.cpick;
+  const sel = !fk ? null : fk === r.cpick ? { label: r.clabel, odds: r.codds } : r.alt && r.alt[fk];
+  if (!sel) return ctx.answerCbQuery('This pick is not available to follow.', { show_alert: true });
   const today = (await q(`SELECT count(*)::int AS n FROM followed WHERE user_id = $1 AND created_at > now() - interval '1 day'`, [ctx.u.id])).rows[0].n;
   if (today >= MAX_FOLLOW_DAY) return ctx.answerCbQuery(`You can follow up to ${MAX_FOLLOW_DAY} picks a day.`, { show_alert: true });
   const ins = await q(
     `INSERT INTO followed (user_id, match_id, home, away, utc, pick, label, odds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING match_id`,
-    [ctx.u.id, id, r.home, r.away, r.utc, r.cpick, r.clabel, r.codds]);
+    [ctx.u.id, id, r.home, r.away, r.utc, fk, sel.label, sel.odds]);
   return ctx.answerCbQuery(ins.rows.length ? '📌 Following — I\'ll message you the result.' : 'You already follow a pick for this match.', { show_alert: !ins.rows.length });
 });
 const accaFromText = (ctx) => {
@@ -4303,7 +4708,9 @@ bot.command('picks', showHub('picks'));
 bot.command('markets', showHub('markets'));
 bot.command('accas', showHub('acca'));
 bot.command('myzone', showHub('me'));
-bot.action(/^hub:(picks|markets|acca|me)$/, async (ctx) => {
+bot.command('matches', showHub('matches'));
+bot.command('more', showHub('more'));
+bot.action(/^hub:(picks|matches|markets|acca|me|more)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const v = hubView(ctx.match[1], ctx.u);
   await editOrReply(ctx, v.text, v.kb);
@@ -4501,9 +4908,9 @@ process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
 const PUBLIC_COMMANDS = [ // the "/" menu shows categories only; every other command still works when typed (see /help)
   { command: 'menu', description: '🏠 Main menu' },
   { command: 'picks', description: '🔥 Daily picks: Best 10, Top 5, Best 3, Smart…' },
+  { command: 'week', description: '📅 7-day picks: 2 per day, 70%+ chance' },
   { command: 'vip', description: '👑 VIP special: most likely winners today' },
-  { command: 'today', description: "⚽ Today's matches with odds" },
-  { command: 'live', description: '🔴 Live scores' },
+  { command: 'matches', description: '⚽ Matches: today, tomorrow, live, tables' },
   { command: 'markets', description: '📈 Markets: value, goals, HT/FT, combos…' },
   { command: 'accas', description: '🎯 Accumulators: builder, safe slip, weekend' },
   { command: 'myzone', description: '👤 My zone: record, watchlist, refer, account' },
