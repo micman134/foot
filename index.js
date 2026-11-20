@@ -150,6 +150,27 @@ if (process.env.PORT || process.env.ENABLE_HEALTH_SERVER === 'true' || process.e
   http
     .createServer((req, res) => {
       const path = (req.url || '').split('?')[0];
+      if (req.method === 'GET' && path === '/api/safe') {
+        const tok = (req.headers.authorization || '').replace(/^Bearer /, '');
+        const want = process.env.STAKE_API_TOKEN || '';
+        const ok = want && tok.length === want.length && crypto.timingSafeEqual(Buffer.from(tok), Buffer.from(want));
+        if (!ok) { res.writeHead(401); return res.end('unauthorized'); }
+        computeSafe(null).then((best) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(!best ? { ok: true, slip: null } : {
+            ok: true,
+            generatedAt: Date.now(),
+            slip: {
+              odds: best.odds, prob: best.prob,
+              legs: best.legs.map(({ m, sc }) => ({
+                home: m.home, away: m.away, kickoff: m.utc,
+                sign: sc.pick.sign, label: sc.pick.label, odds: sc.pick.odds, p: sc.pick.p,
+              })),
+            },
+          }));
+        }).catch((e) => { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: String(e.message || e) })); });
+        return;
+      }
       if (req.method === 'POST' && path === '/paystack/webhook' && paystackWebhook) return paystackWebhook(req, res);
       if (req.method === 'GET' && path === '/paystack/callback') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -3552,7 +3573,7 @@ async function renderVip(u) {
 }
 
 // ----- Safe slip (Premium): safest combination of 1-3 picks that reaches the target combined odds -----
-async function renderSafe(u) {
+async function computeSafe(u) {
   const pool = byLeague(await accaPool(), u)
     .filter((x) => x.sc.pick.p >= 0.5 && x.sc.pick.odds >= MIN_PICK_ODDS)
     .sort((a, b) => b.sc.pick.p - a.sc.pick.p)
@@ -3571,6 +3592,11 @@ async function renderSafe(u) {
       for (let k = j + 1; k < pool.length; k++) tryCombo([pool[i], pool[j], pool[k]]);
     }
   }
+  return best;
+}
+
+async function renderSafe(u) {
+  const best = await computeSafe(u);
   if (!best) return { text: `🛡 <b>Safe ${SAFE_TARGET_ODDS.toFixed(1)}-odds slip</b>\n\nNo safe combination reaches ${SAFE_TARGET_ODDS.toFixed(1)} odds today. Check back later, or try /acca safe.\n\n` + t(u, 'disc'), kb: null };
   let tx = `🛡 <b>Safe ${SAFE_TARGET_ODDS.toFixed(1)}-odds slip</b>\n<i>The most likely combination of up to 3 picks that still reaches ${SAFE_TARGET_ODDS.toFixed(1)} total odds.</i>\n\n` + FOLLOW_HINT;
   best.legs.forEach(({ m, sc }, i) => {
