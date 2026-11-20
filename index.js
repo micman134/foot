@@ -150,25 +150,16 @@ if (process.env.PORT || process.env.ENABLE_HEALTH_SERVER === 'true' || process.e
   http
     .createServer((req, res) => {
       const path = (req.url || '').split('?')[0];
-      if (req.method === 'GET' && path === '/api/safe') {
+      if (req.method === 'GET' && (path === '/api/safe' || path === '/api/picks')) {
         const tok = (req.headers.authorization || '').replace(/^Bearer /, '');
         const want = process.env.STAKE_API_TOKEN || '';
         const ok = want && tok.length === want.length && crypto.timingSafeEqual(Buffer.from(tok), Buffer.from(want));
         if (!ok) { res.writeHead(401); return res.end('unauthorized'); }
-        computeSafe(null).then((best) => {
+        const source = path === '/api/safe' ? 'safe' : (new URL(req.url, 'http://x').searchParams.get('source') || 'safe');
+        apiPicks(source).then((out) => {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(!best ? { ok: true, slip: null } : {
-            ok: true,
-            generatedAt: Date.now(),
-            slip: {
-              odds: best.odds, prob: best.prob,
-              legs: best.legs.map(({ m, sc }) => ({
-                home: m.home, away: m.away, kickoff: m.utc,
-                sign: sc.pick.sign, label: sc.pick.label, odds: sc.pick.odds, p: sc.pick.p,
-              })),
-            },
-          }));
-        }).catch((e) => { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: String(e.message || e) })); });
+          res.end(JSON.stringify({ ok: true, source, generatedAt: Date.now(), ...out }));
+        }).catch((e) => { res.writeHead(e.code === 'BAD_SOURCE' ? 400 : 500); res.end(JSON.stringify({ ok: false, error: String(e.message || e) })); });
         return;
       }
       if (req.method === 'POST' && path === '/paystack/webhook' && paystackWebhook) return paystackWebhook(req, res);
@@ -3593,6 +3584,34 @@ async function computeSafe(u) {
     }
   }
   return best;
+}
+
+// /api/safe serves the bot's own analysis, cached so the stake bot never triggers extra API calls (odds/ESPN) on every request
+let _safeCache = { at: 0, val: null, pending: null };
+function safeApiCached() {
+  const ttl = Number(process.env.SAFE_API_CACHE_MIN || 10) * 60000;
+  if (_safeCache.at && Date.now() - _safeCache.at < ttl) return Promise.resolve(_safeCache.val);
+  if (_safeCache.pending) return _safeCache.pending;
+  _safeCache.pending = computeSafe(null)
+    .then((v) => { _safeCache = { at: Date.now(), val: v, pending: null }; return v; })
+    .catch((e) => { _safeCache.pending = null; throw e; });
+  return _safeCache.pending;
+}
+
+// Serves the bot's own cached picks to the stake bot: source = safe | top5 | best3 | best1
+const apiLeg = ({ m, sc }) => ({ home: m.home, away: m.away, kickoff: m.utc, sign: sc.pick.sign, label: sc.pick.label, odds: sc.pick.odds, p: sc.pick.p });
+async function apiPicks(source) {
+  if (source === 'safe') {
+    const best = await safeApiCached();
+    return { slip: best ? { odds: best.odds, prob: best.prob, legs: best.legs.map(apiLeg) } : null };
+  }
+  let list;
+  if (source === 'top5') list = await computeTop5();
+  else if (source === 'best3' || source === 'best1') {
+    list = (await computeBest3()).list;
+    if (source === 'best1') list = list.slice(0, 1);
+  } else { const e = new Error('unknown source (use safe, top5, best3, best1)'); e.code = 'BAD_SOURCE'; throw e; }
+  return { picks: list.filter((x) => x.m.utc > Date.now() && x.sc && x.sc.pick).map(apiLeg) };
 }
 
 async function renderSafe(u) {
