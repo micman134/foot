@@ -112,8 +112,8 @@ const WEEK_AI_PER_DAY = Number(process.env.WEEK_AI_PER_DAY || 6);        // /wee
 const MIN_PICK_ODDS = Number(process.env.MIN_PICK_ODDS || 1.15); // skip "pointless" 1.05 favourites in Top 5
 const MAX_AI_MATCHES = Number(process.env.MAX_AI_MATCHES || 40); // how many top candidates get an LLM opinion
 // ----- Model tuning -----
-const W_MKT = Number(process.env.W_MARKET || 0.62);  // market odds are the strongest single signal
-const W_FORM = Number(process.env.W_FORM || 0.30);   // team-rating Poisson model
+let W_MKT = Number(process.env.W_MARKET || 0.62);  // market odds are the strongest single signal
+let W_FORM = Number(process.env.W_FORM || 0.30);   // team-rating Poisson model
 const W_AI = Number(process.env.W_AI || 0.15);       // small LLMs are weak at probabilities -> low weight
 const AI_MAX_DEV = Number(process.env.AI_MAX_DEV || 0.08); // LLM may move each outcome at most +-8 pts away from the market
 const FORM_HALF_LIFE_DAYS = Number(process.env.FORM_HALF_LIFE_DAYS || 75); // older results count less
@@ -337,7 +337,7 @@ async function oddsGet(url, timeoutMs = 20000, tries = 2) {
   return res;
 }
 
-async function fetchOdds(sportKey) {
+async function fetchOddsLive(sportKey) {
   if (!ODDS_KEY) return [];
   const url =
     `https://api.the-odds-api.com/v4/sports/${sportKey}/odds` +
@@ -383,6 +383,8 @@ async function fetchOdds(sportKey) {
       return {
         home: ev.home_team,
         away: ev.away_team,
+        id: ev.id,
+        sport: sportKey,
         time: new Date(ev.commence_time).getTime(),
         n,
         odds: { H: avg('H'), D: avg('D'), A: avg('A') },
@@ -392,6 +394,38 @@ async function fetchOdds(sportKey) {
       };
     })
     .filter(Boolean);
+}
+
+// ---------- Odds snapshots saved in Postgres (survive restarts / deploys, protect the monthly credits) ----------
+const ODDS_PERSIST_MS = Number(process.env.ODDS_PERSIST_MIN || 60) * 60e3; // reuse a saved snapshot younger than this
+async function oddsDbGet(key, maxAgeMs) {
+  if (!dbReady) return null;
+  try {
+    const r = await q('SELECT data, at FROM odds_cache WHERE key = $1', [key]);
+    if (r.rows.length && Date.now() - Number(r.rows[0].at) < maxAgeMs) return { data: r.rows[0].data, at: Number(r.rows[0].at) };
+  } catch (e) { console.log('odds_cache read failed:', e.message); }
+  return null;
+}
+async function oddsDbSet(key, data) {
+  if (!dbReady) return;
+  try { await q('INSERT INTO odds_cache (key, data, at) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, at = EXCLUDED.at', [key, JSON.stringify(data), Date.now()]); }
+  catch (e) { console.log('odds_cache write failed:', e.message); }
+}
+async function fetchOdds(sportKey, opts = {}) {
+  const key = 'odds:' + sportKey;
+  if (!opts.fresh) {
+    const hit = await oddsDbGet(key, ODDS_PERSIST_MS);
+    if (hit && Array.isArray(hit.data)) return hit.data;
+  }
+  try {
+    const ev = await fetchOddsLive(sportKey);
+    oddsDbSet(key, ev);
+    return ev;
+  } catch (e) {
+    const old = await oddsDbGet(key, 6 * 3600e3); // Odds API down / rate-limited: serve the last snapshot (max 6h old) instead of nothing
+    if (old && Array.isArray(old.data)) { console.log(`Odds API failed for ${sportKey} (${e.message}) - using saved odds from ${Math.round((Date.now() - old.at) / 60e3)} min ago`); return old.data; }
+    throw e;
+  }
 }
 
 function findOdds(fix, events) {
@@ -586,9 +620,68 @@ async function espnTeamGames(slug, teamId) {
   }
 }
 
+// TheSportsDB fallback for team history (free key, ~30 requests/minute -> serialised). Used when ESPN has no schedule for a team.
+let sdbChain = Promise.resolve();
+function sdbJson(path) {
+  const run = async () => {
+    let res = null;
+    for (const key of ['3', '123']) {
+      res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/${key}/${path}`, { headers: FEED_HEADERS }, 15000, 2);
+      if (res.ok) break;
+    }
+    if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+    return res.json();
+  };
+  const p = sdbChain.then(run, run);
+  sdbChain = p.then(() => sleep(2100), () => sleep(2100));
+  return p;
+}
+function sdbTeamId(name) {
+  return cached('sdbid:' + name, 7 * 24 * 3600e3, async () => {
+    const d = await sdbJson('searchteams.php?t=' + encodeURIComponent(name));
+    let best = null, bs = 0;
+    for (const t0 of d.teams || []) {
+      if (!/soccer|football/i.test(t0.strSport || '')) continue;
+      const sc = nameScore(name, t0.strTeam || '');
+      if (sc > bs) { bs = sc; best = t0; }
+    }
+    return best && bs >= 0.99 ? best.idTeam : null;
+  });
+}
+const sdbHistFail = new Map();
+async function sdbTeamGames(name) {
+  if (!name || (sdbHistFail.get(name) || 0) > Date.now()) return [];
+  try {
+    return await cached('sdbhist:' + name, 12 * 3600e3, async () => {
+      const id = await sdbTeamId(name);
+      if (!id) return [];
+      const d = await sdbJson('eventslast.php?id=' + id);
+      const out = [];
+      for (const ev of d.results || []) {
+        const gh = scoreNum(ev.intHomeScore), ga = scoreNum(ev.intAwayScore);
+        if (gh == null || ga == null) continue;
+        const home = String(ev.idHomeTeam) === String(id);
+        const iso = ev.strTimestamp ? ev.strTimestamp : `${ev.dateEvent}T${ev.strTime || '12:00:00'}`;
+        const ms = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + 'Z').getTime();
+        if (!Number.isFinite(ms)) continue;
+        out.push({ date: new Date(ms).toISOString(), home, gf: home ? gh : ga, ga: home ? ga : gh, opp: (home ? ev.strAwayTeam : ev.strHomeTeam) || 'opponent' });
+      }
+      return out.sort((a, b) => new Date(b.date) - new Date(a.date));
+    });
+  } catch (e) {
+    sdbHistFail.set(name, Date.now() + 30 * 60e3);
+    console.log('TheSportsDB team history unavailable for', name, '-', e.message);
+    return [];
+  }
+}
+async function teamHistory(slug, espnId, name) {
+  let g = await espnTeamGames(slug, espnId);
+  if (g.length < 3) { const f = await sdbTeamGames(name); if (f.length > g.length) g = f; }
+  return g;
+}
 // Same shape as statAnalysis, built from each team's previous matches (no football-data season needed)
 async function extraAnalysis(m) {
-  const [hg, ag] = await Promise.all([espnTeamGames(m.slug, m.espnHomeId), espnTeamGames(m.slug, m.espnAwayId)]);
+  const [hg, ag] = await Promise.all([teamHistory(m.slug, m.espnHomeId, m.homeFull), teamHistory(m.slug, m.espnAwayId, m.awayFull)]);
   let form = null;
   if (hg.length >= 3 && ag.length >= 3) {
     const avg = (arr, k) => arr.reduce((x, g) => x + g[k], 0) / arr.length;
@@ -610,6 +703,7 @@ const oxCache = { day: '', at: 0, partial: false, list: [] };
 async function oddsApiEventsDay(today) {
   if (!ODDS_KEY) return [];
   const copy = (l) => l.map((x) => ({ ...x }));
+  if (oxCache.day !== today) { const d = await oddsDbGet('oxday:' + today, 45 * 60e3); if (d && d.data && Array.isArray(d.data.list)) Object.assign(oxCache, { day: today, at: d.at, partial: !!d.data.partial, list: d.data.list }); }
   const ttl = oxCache.partial ? 5 * 60e3 : 45 * 60e3;
   if (oxCache.day === today && Date.now() - oxCache.at < ttl) { extraDiag.oxErr = oxCache.partial ? 'rate-limited (partial, cached)' : ''; return copy(oxCache.list); }
   if (Date.now() < oddsCooldownUntil) { extraDiag.oxErr = 'cooling down after 429'; return oxCache.day === today ? copy(oxCache.list) : []; }
@@ -640,6 +734,7 @@ async function oddsApiEventsDay(today) {
       });
     }
     Object.assign(oxCache, { day: today, at: Date.now(), partial: limited, list: out });
+    oddsDbSet('oxday:' + today, { partial: limited, list: out });
     extraDiag.oxErr = limited ? 'rate-limited (partial)' : '';
     return copy(out);
   } catch (e) { extraDiag.oxErr = (e.cause && e.cause.code) || e.message; return []; }
@@ -1547,12 +1642,14 @@ function deepAnalysis(m) {
     const hp = teamProfile(teamGames(season, m.homeId), tbl, m.homeId, m.utc, true);
     const ap = teamProfile(teamGames(season, m.awayId), tbl, m.awayId, m.utc, false);
     const mk = base.form ? poissonMarkets(base.form.lh, base.form.la) : null;
+    const inj = await getInjuries(m).catch(() => null);
     const extra = [
+      injLine(inj),
       profileLine(m.homeFull, hp, 'at home'),
       profileLine(m.awayFull, ap, 'away'),
       mk ? `Goal model: over 2.5 goals ${pct(mk.over25)}%, both teams score ${pct(mk.btts)}%, likeliest score ${mk.score}.` : '',
     ].filter(Boolean).join('\n');
-    return { ...base, hp, ap, mk, extra, table: DOMESTIC.has(m.comp) && tbl.rows.length >= 8 };
+    return { ...base, hp, ap, mk, extra, inj, table: DOMESTIC.has(m.comp) && tbl.rows.length >= 8 };
   });
 }
 
@@ -1575,7 +1672,7 @@ function pickScore(m, st, minConf = 0) {
   // penalties: model leans a different way than the pick, or model and market are far apart (usually = missing info like injuries)
   const split = (st.form && argmax(st.form) !== pick.k ? 0.05 : 0) + (st.ai && argmax(st.ai.probs) !== pick.k ? 0.02 : 0);
   const dis = st.disagree != null ? DISAGREE_PENALTY * Math.max(0, st.disagree - 0.05) : 0;
-  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis };
+  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis - injPenalty(st, pick.k) };
 }
 const best3Score = (m, st) => pickScore(m, st, BEST3_MIN_CONF);
 
@@ -1691,7 +1788,7 @@ function comboScore(m, st, minConf = 0, allow = null) {
   const tired = side && side.restDays != null && side.restDays < 3 ? 0.02 : 0;
   const split = goals ? 0 : (st.form && !supports(st.form) ? 0.05 : 0) + (st.ai && !supports(st.ai.probs) ? 0.02 : 0);
   const dis = st.disagree != null ? DISAGREE_PENALTY * Math.max(0, st.disagree - 0.05) : 0;
-  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis };
+  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis - injPenalty(st, pick.k) };
 }
 
 async function dayCached(key, raw, okFn) {
@@ -1963,6 +2060,8 @@ async function renderStats() {
   t += row('Market odds', 'mkt') + row('Form model', 'form') + row('Elo model', 'elo') + row('AI', 'ai') + row('Final blend', 'final');
   t += CAL.T !== 1 ? `🔧 Self-calibration ON: T = ${CAL.T.toFixed(2)} (fitted ${CAL.fitted.toFixed(2)} on ${CAL.n} finished matches)\n` : `🔧 Self-calibration waits for ${CAL_MIN}+ finished matches (have ${CAL.n}).\n`;
 
+  { const lastT = tuneState.hist[tuneState.hist.length - 1];
+    t += `⚖️ Weights: market ${W_MKT.toFixed(2)} · form ${W_FORM.toFixed(2)}` + (lastT ? ` · auto-tuned ${fmtDate(lastT.at)} (form share ${pct(lastT.from)}% → ${pct(lastT.to)}%)` : tuneState.on ? ` · auto-tune on (needs ${AUTOTUNE_MIN}+ matches)` : '') + '\n'; }
   // published picks: accuracy + flat-stake ROI
   const picks = done.filter((x) => x.tags && x.tags.length);
   for (const [tag, label] of [['top5', 'Top 5'], ['best10', 'Best 10'], ['best3', 'Best 3']]) {
@@ -1977,6 +2076,11 @@ async function renderStats() {
     const hit = last30.filter((x) => argmax(x.final) === x.res).length;
     const ro = roiOf(last30);
     t += `\n📅 Last 30 days: ${hit}/${last30.length} correct (${pct(hit / last30.length)}%)` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
+  }
+  const clvs = predLog.map(clvOf).filter((x) => x != null);
+  if (clvs.length >= 5) {
+    const avgC = clvs.reduce((a, b) => a + b, 0) / clvs.length;
+    t += `\n📐 Closing-line value: avg ${signed(avgC * 100)}% · ${pct(clvs.filter((x) => x > 0).length / clvs.length)}% of picks beat the closing price <i>(${clvs.length} picks; positive = you got a better price than the market closed at)</i>`;
   }
   const byComp = new Map();
   for (const r of picks) { if (!byComp.has(r.comp)) byComp.set(r.comp, []); byComp.get(r.comp).push(r); }
@@ -2183,6 +2287,7 @@ async function initDb() {
   await q(`CREATE TABLE IF NOT EXISTS promo_redemptions (
     code TEXT, user_id BIGINT, redeemed_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (code, user_id))`);
   await q(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
+  await q(`CREATE TABLE IF NOT EXISTS odds_cache (key TEXT PRIMARY KEY, data JSONB NOT NULL, at BIGINT NOT NULL)`);
   dbReady = true;
 }
 
@@ -2691,6 +2796,7 @@ async function renderDetailFor(m, backData, u) {
     (s.recent.length ? `\n   ${s.recent.map(esc).join(' · ')}` : '') + '\n';
   tx += teamBlock(m.home, st.hs) + teamBlock(m.away, st.as);
   if (st.h2h.length) tx += `🔁 H2H this season: ${st.h2h.map(esc).join('; ')}\n`;
+  tx += injText(m, st.inj);
 
   const pick = topPick(m, st.final);
   tx += '\n🔮 <b>Prediction</b>\n';
@@ -2807,12 +2913,13 @@ async function renderSmart(u, kind) {
     list = applyPrefs(all, u).slice(0, kind === 'smart5' ? 5 : 10);
     if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null };
   }
+  for (const x of list) if (x.sc.pick.k === 'GG' || x.sc.pick.k === 'NG') await ensureGoalOdds(x.m).catch(() => null);
   const head = { smart10: '🎯🔟 <b>Smart 10 — most likely market per match</b>', smart5: '🎯🏆 <b>Smart 5 — most likely market per match</b>', smart3: '🎯💎 <b>Smart 3 — most likely market per match</b>' }[kind];
   let tx = `${head}\n${note}\n${MARKET_HINT}${FOLLOW_HINT}`;
   list.forEach(({ m, st, sc }, i) => {
     const p = sc.pick;
     tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence · ${sc.agreeN}/${sc.total} sources agree\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${gxBook(m, p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% confidence · ${sc.agreeN}/${sc.total} sources agree\n`;
     tx += srcLine(m, st, p);
     if (st.mk && st.form) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
     const r = reasonOf(m, st);
@@ -2901,9 +3008,10 @@ async function renderWeek(u, oIn) {
     }
     for (const { m, st, sc } of list) {
       const p = sc.pick;
+      if (p.k === 'GG' || p.k === 'NG') await ensureGoalOdds(m).catch(() => null);
       n++; probSum += p.p; probAll *= p.p; shown.push({ m, k: p.k }); registerAlt(m, p);
       tx += `${n}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
-      tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
+      tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) ${oddsTxt(p)}${gxBook(m, p)}${bestPriceTxt(m, p.k)} · ${dotOf(p.p)} ${pct(p.p)}% · ${sc.agreeN}/${sc.total} sources agree\n`;
       tx += srcLine(m, st, p);
       if (st.mk && st.form) tx += `   ⚽ Expected ${st.form.lh.toFixed(1)}–${st.form.la.toFixed(1)} · likeliest ${st.mk.score} · O2.5 ${pct(st.mk.over25)}% · BTTS ${pct(st.mk.btts)}%\n`;
       if (st.form && st.form.tech && st.form.tech.length > 1) tx += `   🔬 ${esc(st.form.tech.join(' + '))}\n`;
@@ -3271,14 +3379,15 @@ async function renderMarketBoard(u, cat) {
 async function renderAllMarkets(m, u) {
   const st = bestKnown(m, await deepAnalysis(m));
   const b = buildMarkets(m, st);
+  const gx = await ensureGoalOdds(m).catch(() => null);
   let tx = `📋 <b>All markets</b>\n<b>${esc(m.home)} vs ${esc(m.away)}</b>\n🏆 ${esc(m.compName)} · 🕒 ${fmtDate(m.utc)} ${fmtTime(m.utc)}\n`;
   if (!b) return { text: tx + '\nNot enough data to price this match.\n\n' + t(u, 'disc'), kb: null };
   const g = (grp, cat) => b.mk.filter((x) => x.group === grp && (!cat || x.cat === cat));
   const row = (arr, f = (x) => `${x.code} ${pct(x.p)}%`) => arr.map(f).join(' · ');
   tx += `⚽ Expected goals ${b.approx ? '≈' : ''}${b.lh.toFixed(1)}–${b.la.toFixed(1)}${b.approx ? ' <i>(inferred from the 1X2 odds — no team-stats data)</i>' : ''}\n<i>Fair odds = 100 ÷ chance (50% → 2.00). Bet only if the bookie pays more.</i>\n`;
   tx += `\n🏁 <b>Result</b>\n1X2: ${row(g('x12'))}\nDouble chance: ${row(g('dc'))}\nDraw no bet: ${row(g('dnb'), (x) => `${x.code} ${pct(x.p)}%`)} <i>(stake back on a draw ${pct(g('dnb')[0].push)}%)</i>\n`;
-  tx += `\n⚽ <b>Goals</b>\nBTTS: ${row(g('bts'))}\n`;
-  for (const L of [0.5, 1.5, 2.5, 3.5]) { const o = b.mk.find((x) => x.code === `OV ${L}`), un = b.mk.find((x) => x.code === `UN ${L}`); tx += `${L}: Over ${pct(o.p)}% (fair ${fair(o.p)}) · Under ${pct(un.p)}% (fair ${fair(un.p)})\n`; }
+  tx += `\n⚽ <b>Goals</b>\nBTTS: ${row(g('bts'))}${btsReal(gx)}\n`;
+  for (const L of [0.5, 1.5, 2.5, 3.5]) { const o = b.mk.find((x) => x.code === `OV ${L}`), un = b.mk.find((x) => x.code === `UN ${L}`); tx += `${L}: Over ${pct(o.p)}% (fair ${fair(o.p)}) · Under ${pct(un.p)}% (fair ${fair(un.p)})${ouReal(gx, L)}\n`; }
   tx += `Team goals: ${row(g('team'), (x) => `${x.code.replace('Home', esc(m.home)).replace('Away', esc(m.away))} ${pct(x.p)}%`)}\nMulti-goals: ${row(g('multi'))}\n`;
   tx += `\n⏱ <b>Half-time / Full-time</b>\n${row(g('htft').slice(0, 3))}\n${row(g('htft').slice(3, 6))}\n${row(g('htft').slice(6, 9))}\n`;
   tx += `First half: ${row(g('half').slice(0, 3), (x) => `${x.code.replace('HT ', '')} ${pct(x.p)}%`)}\nSecond half: ${row(g('half').slice(3), (x) => `${x.code.replace('2HT ', '')} ${pct(x.p)}%`)}\n`;
@@ -3988,6 +4097,245 @@ async function settleTick() {
   const subs = (await q(`SELECT id FROM users WHERE sub_daily AND NOT banned AND NOT blocked AND (excluded_until IS NULL OR excluded_until <= now()) AND (plan_until > now() OR id = ANY($1::bigint[]) OR $2::boolean)`, [ADMIN_IDS, isFree('daily')])).rows;
   for (const s of subs) { await sendTo(s.id, tx); await sleep(40); }
 }
+// =====================================================================
+//  FEATURE PACK 2 — injuries, real goal-market prices, CLV, auto-tune weights, public channel
+// =====================================================================
+const getSetting = async (key) => { try { const r = await q('SELECT value FROM settings WHERE key = $1', [key]); return r.rows[0] ? r.rows[0].value : null; } catch (e) { return null; } };
+const setSetting = (key, value) => q('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, value]);
+
+// ----- Injuries (API-Football, key in API_FOOTBALL_KEY). ONE request per match date covers every fixture, so the 100/day free quota is plenty -----
+const API_FB_KEY = process.env.API_FOOTBALL_KEY || '';
+const API_FB_MAX_DAY = Number(process.env.API_FOOTBALL_MAX_DAY || 80);
+const apiFb = { day: '', n: 0, err: '', failUntil: 0 };
+function injuriesForDate(d) {
+  return cached('inj:' + d, 2 * 3600e3, async () => {
+    const day = localDate(new Date());
+    if (apiFb.day !== day) { apiFb.day = day; apiFb.n = 0; }
+    if (apiFb.n >= API_FB_MAX_DAY) throw new Error('daily request cap reached');
+    apiFb.n++;
+    const res = await fetchRetry(`https://v3.football.api-sports.io/injuries?date=${d}`, { headers: { 'x-apisports-key': API_FB_KEY, Accept: 'application/json' } }, 20000, 2);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    const errs = j.errors && (Array.isArray(j.errors) ? j.errors : Object.values(j.errors));
+    if (errs && errs.length) throw new Error(String(errs[0]).slice(0, 140));
+    apiFb.err = '';
+    return (j.response || []).map((x) => ({ team: x.team && x.team.name, name: x.player && x.player.name, type: x.player && x.player.type, reason: x.player && x.player.reason })).filter((x) => x.team && x.name);
+  });
+}
+async function getInjuries(m) {
+  if (!API_FB_KEY || Date.now() < apiFb.failUntil) return null;
+  try {
+    const list = await injuriesForDate(new Date(m.utc).toISOString().slice(0, 10));
+    return {
+      H: list.filter((x) => nameScore(x.team, m.homeFull) >= 0.99 || nameScore(x.team, m.home) >= 0.99),
+      A: list.filter((x) => nameScore(x.team, m.awayFull) >= 0.99 || nameScore(x.team, m.away) >= 0.99),
+    };
+  } catch (e) {
+    apiFb.err = e.message; apiFb.failUntil = Date.now() + 30 * 60e3;
+    console.log('Injuries unavailable (API-Football):', e.message);
+    return null;
+  }
+}
+const injOut = (x) => /missing/i.test(x.type || '');
+const injNames = (arr) => arr.slice(0, 5).map((x) => `${injOut(x) ? '❌' : '❓'} ${x.name}`).join(', ') + (arr.length > 5 ? ` +${arr.length - 5}` : '');
+function injLine(inj) {
+  if (!inj || (!inj.H.length && !inj.A.length)) return '';
+  return `Reported absences - home: ${inj.H.length ? injNames(inj.H) : 'none'}; away: ${inj.A.length ? injNames(inj.A) : 'none'}. (X = ruled out, ? = doubtful)`;
+}
+function injText(m, inj) {
+  if (!inj || (!inj.H.length && !inj.A.length)) return '';
+  return `🚑 <b>Absences</b> — ${esc(m.home)}: ${inj.H.length ? esc(injNames(inj.H)) : 'none reported'} · ${esc(m.away)}: ${inj.A.length ? esc(injNames(inj.A)) : 'none reported'}\n`;
+}
+function injPenalty(st, k) { // small confidence penalty when the side we back has several absentees
+  if (!st || !st.inj) return 0;
+  const side = k === 'H' || k === '1X' ? 'H' : k === 'A' || k === 'X2' ? 'A' : null;
+  if (!side) return 0;
+  const n = st.inj[side].reduce((a, x) => a + (injOut(x) ? 1 : 0.5), 0);
+  return Math.min(0.03, 0.01 * Math.max(0, n - 1));
+}
+
+// ----- Real Over/Under + BTTS prices (The Odds API event endpoint). COSTS credits: 2 per match (totals + btts), so it is OFF by default -----
+// GOALS_ODDS=on to enable · GOALS_ODDS_MAX = matches per day (default 8 = ~16 credits/day)
+const GOALS_ODDS_ON = process.env.GOALS_ODDS === 'on';
+const GOALS_ODDS_MAX = Number(process.env.GOALS_ODDS_MAX || 8);
+const gxDay = { day: '', n: 0 };
+async function ensureGoalOdds(m) {
+  if (!GOALS_ODDS_ON || !ODDS_KEY || !m.odds || !m.odds.id || !m.odds.sport) return null;
+  const key = 'gx:' + m.odds.id;
+  const hit = peek(key);
+  if (hit) return hit;
+  const saved = await oddsDbGet(key, 6 * 3600e3);
+  if (saved) { cache.set(key, { val: saved.data, exp: Date.now() + 30 * 60e3 }); return saved.data; }
+  const day = localDate(new Date());
+  if (gxDay.day !== day) { gxDay.day = day; gxDay.n = 0; }
+  if (gxDay.n >= GOALS_ODDS_MAX) return null;
+  if (oddsCredits.remaining != null && oddsCredits.remaining <= ODDS_LOW_CREDITS * 2) return null;
+  gxDay.n++;
+  try {
+    const url = `https://api.the-odds-api.com/v4/sports/${m.odds.sport}/events/${m.odds.id}/odds?regions=${encodeURIComponent(ODDS_REGIONS)}&markets=totals,btts&oddsFormat=decimal&apiKey=${ODDS_KEY}`;
+    const res = await oddsGet(url, 20000, 2);
+    noteCredits(res);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    const ou = {}, bt = { y: [], n: [] };
+    for (const bk of j.bookmakers || []) for (const mk of bk.markets || []) {
+      if (mk.key === 'totals') for (const o of mk.outcomes || []) { const L = String(o.point); ou[L] = ou[L] || { o: [], u: [] }; (o.name === 'Over' ? ou[L].o : ou[L].u).push(o.price); }
+      else if (mk.key === 'btts') for (const o of mk.outcomes || []) (o.name === 'Yes' ? bt.y : bt.n).push(o.price);
+    }
+    const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+    const out = { ou: {}, btts: bt.y.length || bt.n.length ? { yes: avg(bt.y), no: avg(bt.n) } : null, at: Date.now() };
+    for (const L of Object.keys(ou)) out.ou[L] = { over: avg(ou[L].o), under: avg(ou[L].u) };
+    cache.set(key, { val: out, exp: Date.now() + 30 * 60e3 });
+    oddsDbSet(key, out);
+    return out;
+  } catch (e) { console.log('Goal-market odds failed:', e.message); return null; }
+}
+const gxBook = (m, p) => {
+  if (p.k !== 'GG' && p.k !== 'NG') return '';
+  const gx = m.odds && m.odds.id ? peek('gx:' + m.odds.id) : null;
+  const v = gx && gx.btts ? (p.k === 'GG' ? gx.btts.yes : gx.btts.no) : null;
+  return v ? ` · bookies avg ${v.toFixed(2)}` : '';
+};
+const btsReal = (gx) => (gx && gx.btts && gx.btts.yes && gx.btts.no ? ` · <i>bookies avg GG ${gx.btts.yes.toFixed(2)} / NG ${gx.btts.no.toFixed(2)}</i>` : '');
+const ouReal = (gx, L) => { const x = gx && gx.ou && gx.ou[String(L)]; return x && x.over && x.under ? ` · <i>bookies ${x.over.toFixed(2)} / ${x.under.toFixed(2)}</i>` : ''; };
+
+// ----- Closing-line value: re-read the price shortly before kickoff and compare it with the price we published at -----
+const CLV_ON = process.env.CLV !== 'off';
+function oddsKeyOfComp(comp) {
+  const c = String(comp);
+  if (COMP_TO_ODDS[c]) return COMP_TO_ODDS[c];
+  if (c.startsWith('X:odds:')) return c.slice(7);
+  if (c.startsWith('X:sdb:')) return null;
+  if (c.startsWith('X:')) return ESPN_TO_ODDS[c.slice(2)] || null;
+  return null;
+}
+const clvOf = (r) => {
+  if (!r.close || !r.pubOdds || !r.pubPick) return null;
+  const a = r.pubOdds[r.pubPick], b = r.close[r.pubPick];
+  return a && b ? a / b - 1 : null;
+};
+async function clvTick() {
+  if (!CLV_ON || !ODDS_KEY || Date.now() < oddsCooldownUntil) return;
+  if (oddsCredits.remaining != null && oddsCredits.remaining <= ODDS_LOW_CREDITS) return;
+  const now = Date.now();
+  const due = predLog.filter((r) => r.tags && r.tags.length && !r.res && !r.clvAt && r.pubOdds && r.pubPick && r.utc - now > 60e3 && r.utc - now < 15 * 60e3);
+  if (!due.length) return;
+  const byKey = new Map();
+  for (const r of due) {
+    const k = oddsKeyOfComp(r.comp);
+    if (!k) { r.clvAt = -1; predDirty.add(r.id); continue; } // no odds feed for this league
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(r);
+  }
+  for (const [k, rows] of byKey) {
+    let events;
+    try { events = await fetchOdds(k, { fresh: true }); } catch (e) { console.log('CLV fetch failed', k, e.message); continue; }
+    for (const r of rows) {
+      const ev = findOdds({ home: r.home, away: r.away, utc: r.utc }, events);
+      if (!ev) continue;
+      r.close = hda(ev.odds); r.clvAt = now; predDirty.add(r.id);
+    }
+  }
+  savePredLog();
+}
+
+// ----- Auto-tuned blend weights (market vs form): weekly, bounded, reversible with /autotune reset -----
+const AUTOTUNE_MIN = Number(process.env.AUTOTUNE_MIN || 200); // settled matches (with market + form) needed
+const AUTOTUNE_STEP = Number(process.env.AUTOTUNE_STEP || 0.05); // max move of the form share per week
+const W_ENV = { mkt: W_MKT, form: W_FORM };
+const tuneState = { on: process.env.AUTOTUNE !== 'off', last: 0, hist: [] };
+const saveWeights = () => setSetting('weights', JSON.stringify({ on: tuneState.on, last: tuneState.last, hist: tuneState.hist, mkt: W_MKT, form: W_FORM, applied: tuneState.hist.length > 0 }));
+async function loadWeights() {
+  try {
+    const v = await getSetting('weights');
+    if (!v) return;
+    const j = JSON.parse(v);
+    if (typeof j.on === 'boolean') tuneState.on = j.on;
+    tuneState.last = Number(j.last) || 0;
+    tuneState.hist = Array.isArray(j.hist) ? j.hist.slice(-8) : [];
+    if (j.applied && j.mkt > 0 && j.form >= 0) { W_MKT = j.mkt; W_FORM = j.form; console.log(`Auto-tuned weights loaded: market ${W_MKT.toFixed(2)} · form ${W_FORM.toFixed(2)}`); }
+  } catch (e) { console.log('Could not load tuned weights:', e.message); }
+}
+async function autoTuneTick(force = false) {
+  if (!force && (!tuneState.on || Date.now() - tuneState.last < 7 * 864e5)) return null;
+  const done = predLog.filter((r) => r.res && r.final);
+  const n = done.filter((x) => x.form && x.mkt).length;
+  if (n < AUTOTUNE_MIN) return { skipped: `need ${AUTOTUNE_MIN}+ settled matches with market and form data (have ${n})` };
+  const tw = tuneWeights(done);
+  tuneState.last = Date.now();
+  if (!tw || tw.v >= tw.curV - 0.002) { await saveWeights(); return { skipped: 'current weights are already close to optimal' }; }
+  const total = W_MKT + W_FORM;
+  const cur = W_FORM / total;
+  const step = Math.max(-AUTOTUNE_STEP, Math.min(AUTOTUNE_STEP, tw.wf - cur));
+  const next = Math.max(0.1, Math.min(0.5, cur + step));
+  if (Math.abs(next - cur) < 0.005) { await saveWeights(); return { skipped: 'change would be negligible' }; }
+  W_FORM = total * next; W_MKT = total - W_FORM;
+  tuneState.hist.push({ at: Date.now(), from: cur, to: next, n });
+  tuneState.hist = tuneState.hist.slice(-8);
+  await saveWeights();
+  notifyAdmins(`⚖️ <b>Auto-tune</b>: form share ${pct(cur)}% → <b>${pct(next)}%</b> (best on ${n} settled matches is ${pct(tw.wf)}%). Market ${W_MKT.toFixed(2)} · form ${W_FORM.toFixed(2)}. Undo with /autotune reset.`).catch(() => {});
+  return { changed: true, from: cur, to: next, n };
+}
+
+// ----- Public Telegram channel: free Best 10 in the morning, settled results at night -----
+const CHANNEL_ID = process.env.CHANNEL_ID || ''; // @yourchannel or -100xxxxxxxxxx (the bot must be an admin of the channel)
+const CHANNEL_HOUR = Number(process.env.CHANNEL_HOUR || 9);
+const CHANNEL_RESULTS_HOUR = Number(process.env.CHANNEL_RESULTS_HOUR || 22);
+let chanBackoff = 0;
+let botUser = '';
+async function botLink() {
+  if (!botUser) { const me = bot.botInfo || (await bot.telegram.getMe()); botUser = me.username; }
+  return `https://t.me/${botUser}`;
+}
+async function chanSend(text) {
+  const kb = Markup.inlineKeyboard([[Markup.button.url('🤖 Open the bot · Premium picks', await botLink())]]);
+  await bot.telegram.sendMessage(CHANNEL_ID, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb.reply_markup });
+}
+async function renderChannelMorning() {
+  const list = (await computeBest10()).filter(isUpcoming).slice(0, 10);
+  if (!list.length) return null;
+  const day = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday: 'long', day: '2-digit', month: 'short' }).format(new Date());
+  let tx = `☀️ <b>Free Best 10 — ${day}</b>\n━━━━━━━━━━━━━━\n`;
+  list.forEach(({ m, sc }, i) => {
+    const p = sc.pick;
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)} · ${dotOf(p.p)} ${pct(p.p)}%\n`;
+  });
+  tx += '\n' + sectionLine('best10') + '🔒 <i>Top 5, Best 3, Best 1, value bets and accas are in the bot.</i>\n\n' + DISCLAIMER_EN();
+  return tx;
+}
+async function postChannelResults(day, force = false) {
+  const rows = predLog.filter((r) => r.tags && r.tags.includes('best10') && r.final && localDate(new Date(r.utc)) === day);
+  const settled = rows.filter((r) => r.res);
+  const pending = rows.length - settled.length;
+  const h = hourTz(new Date(), TZ);
+  if (!settled.length || (!force && pending > 0 && h < CHANNEL_RESULTS_HOUR + 1)) return false;
+  let won = 0, tx = `🌙 <b>Results — free Best 10</b>\n━━━━━━━━━━━━━━\n`;
+  for (const r of settled.sort((a, b) => a.utc - b.utc)) {
+    const k = r.pubPick || argmax(r.final);
+    const ok = k === r.res;
+    if (ok) won++;
+    const o = (r.pubOdds || r.odds || {})[k];
+    tx += `${ok ? '✅' : '❌'} ${esc(r.home)} vs ${esc(r.away)} — ${esc(pickName(r.home, r.away, k))}${o ? ' @ ' + o.toFixed(2) : ''} · ${sign1x2[r.res]}${r.score ? ' (' + esc(r.score) + ')' : ''}\n`;
+  }
+  tx += `\n<b>${won}/${settled.length}</b> correct today` + (pending ? ` · ${pending} still pending` : '') + '\n\n' + sectionLine('best10') + '⚠️ <i>18+ · bet responsibly. Past results do not guarantee future results.</i>';
+  await chanSend(tx);
+  return true;
+}
+async function channelTick() {
+  if (!CHANNEL_ID || Date.now() < chanBackoff) return;
+  const now = new Date(), day = localDate(now), h = hourTz(now, TZ);
+  if (h >= CHANNEL_HOUR && h < CHANNEL_HOUR + 8 && (await getSetting('chan_morning')) !== day) {
+    if (!(await getMatchesToday()).length) { chanBackoff = Date.now() + 30 * 60e3; return; }
+    const tx = await renderChannelMorning();
+    if (!tx) { chanBackoff = Date.now() + 20 * 60e3; return; } // odds not out yet
+    await chanSend(tx);
+    await setSetting('chan_morning', day);
+  }
+  if (h >= CHANNEL_RESULTS_HOUR && (await getSetting('chan_results')) !== day) {
+    if (await postChannelResults(day)) await setSetting('chan_results', day);
+  }
+}
+
 let tickN = 0, ticking = false;
 async function schedulerTick() {
   if (ticking || !dbReady) return;
@@ -4001,6 +4349,9 @@ async function schedulerTick() {
     if (tickN % 10 === 0) await expiryTick();
     if (tickN % 15 === 0) await staleTick();
     if (tickN % 30 === 0) await settleTick();
+    if (tickN % 5 === 2) await clvTick().catch((e) => console.log('CLV tick failed:', e.message));
+    if (tickN % 5 === 3) await channelTick().catch((e) => { chanBackoff = Date.now() + 10 * 60e3; console.log('Channel tick failed:', e.message); });
+    if (tickN % 60 === 7) await autoTuneTick().catch((e) => console.log('Auto-tune failed:', e.message));
   } catch (e) { console.log('Scheduler error:', e.message); }
   ticking = false;
 }
@@ -4522,7 +4873,7 @@ bot.on('inline_query', async (ctx) => {
 // ----- admin tools (admins have every feature, no limits) -----
 const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
-  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/free – choose which Premium features are free\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion';
+  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/free – choose which Premium features are free\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion\n/autotune [on|off|now|reset] – weight auto-tuning\n/channel [test|results] – public channel posts';
 bot.command('admin', adminOnly((ctx) => showAdmin(ctx)));
 bot.command('resolve', adminOnly(detach(async (ctx) => {
   const now = Date.now();
@@ -4955,6 +5306,33 @@ bot.command('unexclude', adminOnly(async (ctx) => {
   return reply(ctx, `✅ Self-exclusion lifted for <code>${id}</code>.`);
 }));
 
+// ----- admin: auto-tune + channel -----
+bot.command('autotune', adminOnly(detach(async (ctx) => {
+  const a = argText(ctx).toLowerCase();
+  if (a === 'on' || a === 'off') { tuneState.on = a === 'on'; await saveWeights(); return void (await reply(ctx, `⚖️ Weight auto-tuning is now <b>${a.toUpperCase()}</b>.`)); }
+  if (a === 'reset') {
+    W_MKT = W_ENV.mkt; W_FORM = W_ENV.form; tuneState.hist = []; tuneState.last = 0; await saveWeights();
+    return void (await reply(ctx, `⚖️ Weights reset to your .env values: market ${W_MKT.toFixed(2)} · form ${W_FORM.toFixed(2)}.`));
+  }
+  if (a === 'now') {
+    const r = await autoTuneTick(true);
+    return void (await reply(ctx, r && r.changed ? `⚖️ Form share ${pct(r.from)}% → <b>${pct(r.to)}%</b> (${r.n} matches).` : `⚖️ No change: ${esc((r && r.skipped) || 'nothing to do')}.`));
+  }
+  const lastT = tuneState.hist[tuneState.hist.length - 1];
+  await reply(ctx, `⚖️ <b>Auto-tune</b>: ${tuneState.on ? 'ON' : 'off'}\nMarket ${W_MKT.toFixed(2)} · form ${W_FORM.toFixed(2)} (env: ${W_ENV.mkt.toFixed(2)} / ${W_ENV.form.toFixed(2)})\nRuns weekly once ${AUTOTUNE_MIN}+ matches are settled; max ${pct(AUTOTUNE_STEP)} points per week; form share stays within 10–50%.\n` +
+    (lastT ? `Last change: ${fmtDate(lastT.at)} · form share ${pct(lastT.from)}% → ${pct(lastT.to)}% (${lastT.n} matches)\n` : 'No change applied yet.\n') + '\n/autotune on · off · now · reset');
+})));
+bot.command('channel', adminOnly(detach(async (ctx) => {
+  if (!CHANNEL_ID) return void (await reply(ctx, '📢 Set <code>CHANNEL_ID</code> (e.g. <code>@yourchannel</code>) in your environment and make the bot an admin of that channel.'));
+  const a = argText(ctx).toLowerCase();
+  try {
+    if (a === 'test') { const tx = await renderChannelMorning(); if (!tx) return void (await reply(ctx, 'No free picks ready yet (odds not out).')); await chanSend(tx); return void (await reply(ctx, '✅ Morning post sent.')); }
+    if (a === 'results') { const ok = await postChannelResults(localDate(new Date()), true); return void (await reply(ctx, ok ? '✅ Results post sent.' : 'No settled Best 10 picks today yet.')); }
+  } catch (e) { return void (await reply(ctx, '⚠️ Channel post failed: ' + esc(e.message) + '\nCheck that the bot is an admin with permission to post.')); }
+  await reply(ctx, `📢 <b>Channel</b> ${esc(CHANNEL_ID)}\nMorning post from ${String(CHANNEL_HOUR).padStart(2, '0')}:00 · results from ${String(CHANNEL_RESULTS_HOUR).padStart(2, '0')}:00 (${TZ})\nLast morning post: ${esc((await getSetting('chan_morning')) || 'never')} · last results: ${esc((await getSetting('chan_results')) || 'never')}\n\n/channel test · /channel results`);
+})));
+bot.command('apistatus', adminOnly(async (ctx) => reply(ctx, `🔌 <b>Optional feeds</b>\nInjuries (API-Football): ${API_FB_KEY ? 'key set · ' + apiFb.n + '/' + API_FB_MAX_DAY + ' requests today' + (apiFb.err ? ' · last error: ' + esc(apiFb.err) : '') : 'no key (API_FOOTBALL_KEY)'}\nGoal-market prices: ${GOALS_ODDS_ON ? 'ON · ' + gxDay.n + '/' + GOALS_ODDS_MAX + ' matches today' : 'off (GOALS_ODDS=on)'}\nCLV tracking: ${CLV_ON ? 'on' : 'off'} · ${predLog.filter((r) => r.close).length} closing prices stored\nSaved odds snapshots window: ${Math.round(ODDS_PERSIST_MS / 60e3)} min`)));
+
 bot.catch((err) => console.error('Bot error:', err));
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
@@ -4978,6 +5356,7 @@ async function main() {
   await initDb();
   await loadFree();
   await loadPredLog();
+  await loadWeights();
   console.log(`PostgreSQL ready · ${predLog.length} logged predictions · admins: ${ADMIN_IDS.length || 'NONE (set ADMIN_IDS)'} · Paystack: ${PAYSTACK_KEY ? 'on' : 'off'} · Stars: ${STARS_ON ? 'on' : 'off'}`);
   bot.telegram.setMyCommands(PUBLIC_COMMANDS).catch(() => {});
   for (const id of ADMIN_IDS) {
