@@ -317,12 +317,32 @@ function devig(inv) {
 // sharp / exchange books price more accurately than soft books -> count them more
 const SHARP_BOOKS = { pinnacle: 4, betfair_ex_eu: 3, betfair_ex_uk: 3, matchbook: 2, smarkets: 2 };
 
+// ---------- Odds API request gate: spacing + cooldown after a 429 ----------
+const ODDS_GAP_MS = Number(process.env.ODDS_GAP_MS || 400); // minimum gap between Odds API calls
+let oddsNextAt = 0;
+let oddsCooldownUntil = 0;
+async function oddsGet(url, timeoutMs = 20000, tries = 2) {
+  let res;
+  for (let i = 0; i < tries; i++) {
+    const start = Math.max(Date.now(), oddsCooldownUntil, oddsNextAt); // reserve a slot (safe: JS is single-threaded)
+    oddsNextAt = start + ODDS_GAP_MS;
+    if (start > Date.now()) await sleep(start - Date.now());
+    res = await fetchRetry(url, { headers: FEED_HEADERS }, timeoutMs, 1);
+    if (res.status !== 429) return res;
+    const ra = Number(res.headers.get('retry-after'));
+    const cool = Math.min(Math.max(ra > 0 ? ra * 1000 : 20000 * (i + 1), 5000), 90000);
+    oddsCooldownUntil = Date.now() + cool;
+    console.log(`Odds API rate-limited (429) - pausing ${Math.round(cool / 1000)}s`);
+  }
+  return res;
+}
+
 async function fetchOdds(sportKey) {
   if (!ODDS_KEY) return [];
   const url =
     `https://api.the-odds-api.com/v4/sports/${sportKey}/odds` +
     `?regions=${encodeURIComponent(ODDS_REGIONS)}&markets=h2h&oddsFormat=decimal&apiKey=${ODDS_KEY}`;
-  const res = await fetchRetry(url);
+  const res = await oddsGet(url, 25000, 2);
   noteCredits(res);
   if (!res.ok) throw new Error('Odds API ' + res.status);
   const events = await res.json();
@@ -408,7 +428,7 @@ const ESPN_LEAGUES = {
   'fifa.friendly': 'International Friendly', 'conmebol.libertadores': 'Copa Libertadores', 'conmebol.sudamericana': 'Copa Sudamericana',
   'arg.1': 'Argentina Liga', 'usa.1': 'MLS', 'mex.1': 'Liga MX', 'jpn.1': 'J1 League', 'chn.1': 'Chinese Super League',
   'aus.1': 'A-League', 'ksa.1': 'Saudi Pro League', 'caf.champions': 'CAF Champions League', 'caf.confed': 'CAF Confederation Cup',
-  'concacaf.champions': 'CONCACAF Champions Cup', 'rsa.1': 'South Africa PSL', 'egy.1': 'Egypt Premier League',
+  'concacaf.champions': 'CONCACAF Champions Cup', 'rsa.1': 'South Africa PSL',
   // already covered by football-data but harmless: duplicates are removed below, and they back it up when football-data is slow
   'eng.1': 'Premier League', 'eng.2': 'Championship', 'esp.1': 'La Liga', 'ger.1': 'Bundesliga', 'ita.1': 'Serie A',
   'fra.1': 'Ligue 1', 'ned.1': 'Eredivisie', 'por.1': 'Primeira Liga', 'bra.1': 'Brasileirao', 'uefa.champions': 'Champions League',
@@ -440,16 +460,20 @@ async function espnJson(slug, dateStr) { // tries a few URL shapes; ESPN rejects
   const base = `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard`;
   const variants = [`${base}?dates=${dateStr}`, base, `https://site.web.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard?dates=${dateStr}`];
   let last = '';
+  const codes = [];
   for (const url of variants) {
     try {
       const res = await fetchRetry(url, { headers: FEED_HEADERS }, 15000, 2);
       if (res.ok) return await res.json();
       last = `HTTP ${res.status}`;
+      codes.push(res.status);
       if (res.status === 404) { const e = new Error(last); e.missing = true; throw e; }
-    } catch (e) { if (e.missing) throw e; last = (e.cause && e.cause.code) || e.message; }
+    } catch (e) { if (e.missing) throw e; last = (e.cause && e.cause.code) || e.message; codes.push(0); }
   }
+  if (codes.length && codes.every((c) => c === 400 || c === 404)) { const e = new Error(last); e.missing = true; throw e; } // dead / unsupported slug
   throw new Error(last);
 }
+
 async function espnLeague(slug, today) {
   const dates = [ymd(Date.now())];
   if (/^(usa|mex|arg|bra|conmebol|concacaf)/.test(slug)) dates.push(ymd(Date.now() - 864e5)); // late Americas kickoffs fall on the previous US date
@@ -515,15 +539,25 @@ async function sportsDbDay(dateStr, today) {
 }
 // ---------- Previous matches for extra-league teams (ESPN team schedule) ----------
 const espnTeamFail = new Map();
+const espnSlugDead = new Map(); // whole league blocked (403) -> stop asking for a while
 async function espnTeamGames(slug, teamId) {
   if (!slug || !teamId) return [];
+  if ((espnSlugDead.get(slug) || 0) > Date.now()) return [];
   const key = 'espnteam:' + slug + ':' + teamId;
   if ((espnTeamFail.get(key) || 0) > Date.now()) return [];
   try {
     return await cached(key, 12 * 3600e3, async () => {
-      const res = await fetchRetry(`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${teamId}/schedule`, { headers: FEED_HEADERS }, 12000, 2);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
+      const urls = [
+        `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${teamId}/schedule`,
+        `https://site.web.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${teamId}/schedule`,
+      ];
+      let data = null, lastStatus = '';
+      for (const url of urls) {
+        const res = await fetchRetry(url, { headers: FEED_HEADERS }, 12000, 2);
+        if (res.ok) { data = await res.json(); break; }
+        lastStatus = 'HTTP ' + res.status;
+      }
+      if (!data) throw new Error(lastStatus);
       const games = [];
       for (const ev of data.events || []) {
         const comp = (ev.competitions || [])[0];
@@ -541,11 +575,17 @@ async function espnTeamGames(slug, teamId) {
       return games.sort((a, b) => new Date(b.date) - new Date(a.date));
     });
   } catch (e) {
-    espnTeamFail.set(key, Date.now() + 30 * 60e3);
-    console.log('Team history unavailable', slug, teamId, '-', e.message);
+    if (/403/.test(e.message)) {
+      if (!((espnSlugDead.get(slug) || 0) > Date.now())) console.log(`ESPN team schedules blocked for ${slug} (${e.message}) - skipping this league for 6h`);
+      espnSlugDead.set(slug, Date.now() + 6 * 3600e3);
+    } else {
+      espnTeamFail.set(key, Date.now() + 30 * 60e3);
+      console.log('Team history unavailable', slug, teamId, '-', e.message);
+    }
     return [];
   }
 }
+
 // Same shape as statAnalysis, built from each team's previous matches (no football-data season needed)
 async function extraAnalysis(m) {
   const [hg, ag] = await Promise.all([espnTeamGames(m.slug, m.espnHomeId), espnTeamGames(m.slug, m.espnAwayId)]);
@@ -566,15 +606,25 @@ async function extraAnalysis(m) {
 }
 
 // Third source: The Odds API "events" lists (free, no credits used) - covers every in-season soccer competition it prices.
+const oxCache = { day: '', at: 0, partial: false, list: [] };
 async function oddsApiEventsDay(today) {
   if (!ODDS_KEY) return [];
+  const copy = (l) => l.map((x) => ({ ...x }));
+  const ttl = oxCache.partial ? 5 * 60e3 : 45 * 60e3;
+  if (oxCache.day === today && Date.now() - oxCache.at < ttl) { extraDiag.oxErr = oxCache.partial ? 'rate-limited (partial, cached)' : ''; return copy(oxCache.list); }
+  if (Date.now() < oddsCooldownUntil) { extraDiag.oxErr = 'cooling down after 429'; return oxCache.day === today ? copy(oxCache.list) : []; }
   try {
-    const res = await fetchRetry(`https://api.the-odds-api.com/v4/sports/?apiKey=${ODDS_KEY}`, { headers: FEED_HEADERS }, 20000, 2);
+    const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const res = await oddsGet(`https://api.the-odds-api.com/v4/sports/?apiKey=${ODDS_KEY}`, 20000, 2);
     if (!res.ok) { extraDiag.oxErr = 'sports HTTP ' + res.status; return []; }
     const sports = (await res.json()).filter((x) => String(x.key).startsWith('soccer_') && x.active && !x.has_outrights);
-    const lists = await pool(sports, 5, async (sp) => {
+    const win = `&commenceTimeFrom=${iso(Date.now())}&commenceTimeTo=${iso(Date.now() + 30 * 3600e3)}`; // only the next ~30h
+    let limited = false;
+    const lists = await pool(sports, 2, async (sp) => {
+      if (limited) return []; // first 429 stops the rest of the batch
       try {
-        const r = await fetchRetry(`https://api.the-odds-api.com/v4/sports/${sp.key}/events?apiKey=${ODDS_KEY}&dateFormat=iso`, { headers: FEED_HEADERS }, 15000, 2);
+        const r = await oddsGet(`https://api.the-odds-api.com/v4/sports/${sp.key}/events?apiKey=${ODDS_KEY}&dateFormat=iso${win}`, 15000, 1);
+        if (r.status === 429) { limited = true; return []; }
         if (!r.ok) return [];
         return (await r.json()).map((ev) => ({ ev, sp }));
       } catch (e) { return []; }
@@ -589,9 +639,12 @@ async function oddsApiEventsDay(today) {
         home: ev.home_team, away: ev.away_team, homeFull: ev.home_team, awayFull: ev.away_team, homeId: null, awayId: null, utc, odds: null,
       });
     }
-    return out;
+    Object.assign(oxCache, { day: today, at: Date.now(), partial: limited, list: out });
+    extraDiag.oxErr = limited ? 'rate-limited (partial)' : '';
+    return copy(out);
   } catch (e) { extraDiag.oxErr = (e.cause && e.cause.code) || e.message; return []; }
 }
+
 async function getExtraFixtures(today, existing) {
   if (!EXTRA_ON) return [];
   const slugs = Object.keys(ESPN_LEAGUES);
@@ -1052,7 +1105,7 @@ const deadModels = new Map(); // model -> time until we stop trying it
 let aiPausedUntil = 0; // set on HTTP 402 (credits used up) so we stop hammering the API
 
 // ---- Automatic model discovery: asks the provider which models exist and picks the best chat models ----
-const NOT_CHAT = /whisper|guard|tts|embed|moderat|image|imagen|veo|audio|speech|transcri|orpheus|playai|safeguard|aqa|rerank|dall|vision-preview|live|robotics|gpt-oss|qwen3|deepseek-r1|-r1|reason|think/i; // last group: reasoning models burn the token budget / pollute the JSON
+const NOT_CHAT = /whisper|guard|tts|embed|moderat|image|imagen|veo|audio|speech|transcri|orpheus|playai|safeguard|allam|aqa|rerank|dall|vision-preview|live|robotics|gpt-oss|qwen3|deepseek-r1|-r1|reason|think/i; // last group: reasoning models burn the token budget / pollute the JSON
 function modelScore(id) {
   const x = id.toLowerCase();
   const size = x.match(/(\d+(?:\.\d+)?)b\b/);
@@ -1082,7 +1135,8 @@ async function discoverModels() {
       .filter((id) => id && !NOT_CHAT.test(id));
     if (PROVIDER === 'openrouter') ids = ids.filter((id) => id.endsWith(':free'));
     ids.sort((a, b) => modelScore(b) - modelScore(a));
-    const picked = ids.slice(0, 3);
+    const pref = PRESET.models.split(',').map((x) => x.trim()).filter((x) => ids.includes(x)); // your preset models win when available
+    const picked = [...new Set([...pref, ...ids])].slice(0, 3);
     if (!picked.length) { console.log('Model discovery: provider returned no usable chat models.'); return false; }
     HF_MODELS.splice(0, HF_MODELS.length, ...picked);
     console.log(`AI models auto-selected from ${AI_BASE_URL}: ${picked.join(', ')}`);
