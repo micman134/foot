@@ -73,7 +73,7 @@ function detectProvider() {
 }
 const PROVIDER = detectProvider();
 const PRESETS = {
-  groq: { url: 'https://api.groq.com/openai/v1', models: 'llama-3.3-70b-versatile,llama-3.1-8b-instant', key: process.env.GROQ_API_KEY || AI_KEY, conc: 2 },
+  groq: { url: 'https://api.groq.com/openai/v1', models: 'openai/gpt-oss-20b,openai/gpt-oss-120b', key: process.env.GROQ_API_KEY || AI_KEY, conc: 2 },
   openrouter: { url: 'https://openrouter.ai/api/v1', models: 'meta-llama/llama-3.3-70b-instruct:free,qwen/qwen-2.5-72b-instruct:free', key: process.env.OPENROUTER_API_KEY || AI_KEY, conc: 2 },
   gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai', models: 'gemini-2.0-flash,gemini-1.5-flash', key: process.env.GEMINI_API_KEY || AI_KEY, conc: 2 },
   hf: { url: 'https://router.huggingface.co/v1', models: 'meta-llama/Llama-3.1-8B-Instruct,Qwen/Qwen2.5-7B-Instruct', key: process.env.HF_TOKEN || AI_KEY, conc: 3 },
@@ -1200,7 +1200,7 @@ const deadModels = new Map(); // model -> time until we stop trying it
 let aiPausedUntil = 0; // set on HTTP 402 (credits used up) so we stop hammering the API
 
 // ---- Automatic model discovery: asks the provider which models exist and picks the best chat models ----
-const NOT_CHAT = /whisper|guard|tts|embed|moderat|image|imagen|veo|audio|speech|transcri|orpheus|playai|safeguard|allam|aqa|rerank|dall|vision-preview|live|robotics|gpt-oss|qwen3|deepseek-r1|-r1|reason|think/i; // last group: reasoning models burn the token budget / pollute the JSON
+const NOT_CHAT = /whisper|guard|tts|embed|moderat|image|imagen|veo|audio|speech|transcri|orpheus|playai|safeguard|allam|aqa|rerank|dall|vision-preview|live|robotics|qwen3|deepseek-r1|-r1|reason|think/i; // last group: reasoning models burn the token budget / pollute the JSON
 function modelScore(id) {
   const x = id.toLowerCase();
   const size = x.match(/(\d+(?:\.\d+)?)b\b/);
@@ -1279,8 +1279,9 @@ async function hfPredict(m, st) {
           headers: { 'Content-Type': 'application/json', ...(AI_USE_KEY ? { Authorization: `Bearer ${AI_USE_KEY}` } : {}) },
           body: JSON.stringify({
             model,
-            max_tokens: 250,
+            max_tokens: /gpt-oss|qwen3/i.test(model) ? 1500 : 250, // reasoning models need room to think before the JSON
             temperature: 0.2,
+            ...(/gpt-oss/i.test(model) ? { reasoning_effort: 'low', include_reasoning: false } : {}),
             messages: [
               { role: 'system', content: 'You are a careful football analyst. Base your estimate mainly on the previous matches of both teams given below (recent results, goals scored and conceded, home/away record, opponents faced) and compare it with the bookmaker prices. Use only the data provided. Never invent injuries, lineups or news. Reply with JSON only.' },
               { role: 'user', content: prompt },
@@ -1289,6 +1290,8 @@ async function hfPredict(m, st) {
           signal: AbortSignal.timeout(AI_TIMEOUT_MS),
         });
         if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          console.log(`AI ${res.status} from ${AI_BASE_URL} model=${model}: ${body.slice(0, 300)}`);
           const err = new Error('HTTP ' + res.status);
           err.status = res.status;
           throw err;
@@ -2236,7 +2239,8 @@ const REF_MILESTONE_N = Number(process.env.REF_MILESTONE_N || 3);     // every N
 const REF_MILESTONE_DAYS = Number(process.env.REF_MILESTONE_DAYS || 7);
 const TEASER_HOUR = Number(process.env.TEASER_HOUR || 9);             // free daily tips are sent from this local hour (user's timezone)
 const STALE_DRIFT = Number(process.env.STALE_DRIFT || 0.1);           // price-move alert when a published pick's odds move this much (10%)
-const SAFE_TARGET_ODDS = Number(process.env.SAFE_TARGET_ODDS || 2.0); // /safe builds the safest slip reaching these combined odds
+const SAFE_MIN_P = Number(process.env.SAFE_MIN_P || 0.45); // /safe: minimum win probability per leg
+const SAFE_TARGET_ODDS = Number(process.env.SAFE_TARGET_ODDS || 1.6); // /safe builds the safest slip reaching these combined odds
 const MAX_FOLLOW_DAY = Number(process.env.MAX_FOLLOW_DAY || 30);      // picks a user can follow per day
 const LB_MIN_PICKS = Number(process.env.LB_MIN_PICKS || 5);           // settled followed picks needed to enter the leaderboard
 const VALUE_MIN_EDGE = Number(process.env.VALUE_MIN_EDGE || 0.03);    // model prob must beat the market by this much
@@ -3717,7 +3721,7 @@ async function renderVip(u) {
 // ----- Safe slip (Premium): safest combination of 1-3 picks that reaches the target combined odds -----
 async function renderSafe(u) {
   const pool = byLeague(await accaPool(), u)
-    .filter((x) => x.sc.pick.p >= 0.5 && x.sc.pick.odds >= MIN_PICK_ODDS)
+    .filter((x) => x.sc.pick.p >= SAFE_MIN_P && x.sc.pick.odds >= MIN_PICK_ODDS)
     .sort((a, b) => b.sc.pick.p - a.sc.pick.p)
     .slice(0, 10);
   let best = null;
@@ -5365,9 +5369,23 @@ async function main() {
   if (AI_ON && !process.env.AI_MODELS) discoveryDone = discoverModels().catch(() => false); // AI_MODELS set in .env = manual choice, respected
   setInterval(() => schedulerTick().catch((e) => console.log('tick failed:', e.message)), 60e3).unref();
   setInterval(() => flushPredLog().catch(() => {}), 60e3).unref();
-  bot.launch({ allowedUpdates: ['message', 'callback_query', 'inline_query', 'pre_checkout_query'] })
-    .then(() => console.log(`Football bot started · AI: ${AI_ON ? PROVIDER + ' (' + HF_MODELS.join(', ') + ')' : 'off (odds + form model only)'}`))
-    .catch((e) => { console.error('Launch failed:', e); process.exit(1); });
+  launchBot();
+}
+// Render briefly runs the old and new instance together on deploy -> Telegram answers 409. Wait and retry instead of crashing.
+async function launchBot(attempt = 1) {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
+    console.log(`Football bot starting · AI: ${AI_ON ? PROVIDER + ' (' + HF_MODELS.join(', ') + ')' : 'off (odds + form model only)'}`);
+    await bot.launch({ allowedUpdates: ['message', 'callback_query', 'inline_query', 'pre_checkout_query'] });
+  } catch (e) {
+    if (e && e.response && e.response.error_code === 409 && attempt <= 6) {
+      console.log(`409 conflict (another instance is still polling) - retry ${attempt}/6 in 10s`);
+      await new Promise((r) => setTimeout(r, 10000));
+      return launchBot(attempt + 1);
+    }
+    console.error('Launch failed:', e);
+    process.exit(1);
+  }
 }
 main().catch((e) => { console.error('Startup failed:', e); process.exit(1); });
 const shutdown = (sig) => { flushPredLog().catch(() => {}).finally(() => { try { bot.stop(sig); } catch {} setTimeout(() => process.exit(0), 500); }); };
