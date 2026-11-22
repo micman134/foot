@@ -622,12 +622,16 @@ async function espnTeamGames(slug, teamId) {
 
 // TheSportsDB fallback for team history (free key, ~30 requests/minute -> serialised). Used when ESPN has no schedule for a team.
 let sdbChain = Promise.resolve();
+let sdbBlockedUntil = 0; // circuit breaker: after a 429 stop calling TheSportsDB for a while instead of queueing hundreds of slow calls
+const SDB_HISTORY_ON = String(process.env.SDB_HISTORY || 'on').toLowerCase() !== 'off';
 function sdbJson(path) {
   const run = async () => {
+    if (Date.now() < sdbBlockedUntil) throw new Error('TheSportsDB paused (rate limit)');
     let res = null;
     for (const key of ['3', '123']) {
-      res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/${key}/${path}`, { headers: FEED_HEADERS }, 15000, 2);
+      res = await fetchRetry(`https://www.thesportsdb.com/api/v1/json/${key}/${path}`, { headers: FEED_HEADERS }, 15000, 1);
       if (res.ok) break;
+      if (res.status === 429) { sdbBlockedUntil = Date.now() + 10 * 60e3; console.log('TheSportsDB rate-limited (429) - team-history lookups paused for 10 min, using ESPN/odds only'); break; }
     }
     if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
     return res.json();
@@ -650,7 +654,7 @@ function sdbTeamId(name) {
 }
 const sdbHistFail = new Map();
 async function sdbTeamGames(name) {
-  if (!name || (sdbHistFail.get(name) || 0) > Date.now()) return [];
+  if (!SDB_HISTORY_ON || Date.now() < sdbBlockedUntil || !name || (sdbHistFail.get(name) || 0) > Date.now()) return [];
   try {
     return await cached('sdbhist:' + name, 12 * 3600e3, async () => {
       const id = await sdbTeamId(name);
