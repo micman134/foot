@@ -145,12 +145,16 @@ if (!BOT_TOKEN || !FD_KEY || !process.env.DATABASE_URL) {
 
 // Health server + Paystack webhook (Render etc. need an open port)
 let paystackWebhook = null; // assigned further down when PAYSTACK_SECRET_KEY is set
+const TG_PATH = '/tg/' + crypto.createHash('sha256').update('path:' + BOT_TOKEN).digest('hex').slice(0, 24); // secret URL for Telegram updates
+const TG_SECRET = crypto.createHash('sha256').update('secret:' + BOT_TOKEN).digest('hex').slice(0, 32);   // header Telegram sends with every update
+let tgWebhook = null; // assigned in startWebhook()
 if (process.env.PORT || process.env.ENABLE_HEALTH_SERVER === 'true' || process.env.PAYSTACK_SECRET_KEY) {
   const PORT = process.env.PORT || 3000;
   http
     .createServer((req, res) => {
       const path = (req.url || '').split('?')[0];
       if (req.method === 'POST' && path === '/paystack/webhook' && paystackWebhook) return paystackWebhook(req, res);
+      if (req.method === 'POST' && path === TG_PATH) { if (tgWebhook) return tgWebhook(req, res); res.writeHead(503); return res.end(); }
       if (req.method === 'GET' && path === '/paystack/callback') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;text-align:center;padding:3em"><h2>✅ Payment received</h2><p>Go back to Telegram — Premium unlocks within seconds. If not, tap “I have paid” in the bot.</p></body>');
@@ -1672,6 +1676,7 @@ function whyPopular(short, full, prof, tableOk) {
 function pickScore(m, st, minConf = 0) {
   const pick = topPick(m, st.final);
   if (!pick || !m.odds || !pick.odds || pick.odds < MIN_PICK_ODDS || pick.p < minConf) return null;
+  if (LEAGUE_GATE_MODE === 'exclude' && leagueGated(m.comp)) return null;
   const srcs = [m.odds.probs, st.form, st.ai && st.ai.probs, st.form && st.form.elo].filter(Boolean);
   const agreeN = srcs.filter((x) => argmax(x) === pick.k).length;
   const agree = agreeN / srcs.length;
@@ -1681,7 +1686,7 @@ function pickScore(m, st, minConf = 0) {
   // penalties: model leans a different way than the pick, or model and market are far apart (usually = missing info like injuries)
   const split = (st.form && argmax(st.form) !== pick.k ? 0.05 : 0) + (st.ai && argmax(st.ai.probs) !== pick.k ? 0.02 : 0);
   const dis = st.disagree != null ? DISAGREE_PENALTY * Math.max(0, st.disagree - 0.05) : 0;
-  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis - injPenalty(st, pick.k) };
+  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis - injPenalty(st, pick.k) - leaguePen(m) };
 }
 const best3Score = (m, st) => pickScore(m, st, BEST3_MIN_CONF);
 
@@ -1784,6 +1789,7 @@ function srcLine(m, st, p) {
 function comboScore(m, st, minConf = 0, allow = null) {
   const pick = marketPick(m, st, allow);
   if (!pick || !m.odds || !pick.odds || pick.p < minConf) return null;
+  if (LEAGUE_GATE_MODE === 'exclude' && leagueGated(m.comp)) return null;
   const goals = pick.k === 'GG' || pick.k === 'NG';
   const single = pick.k === 'H' || pick.k === 'A';
   // a source "supports" the pick when it leans the same way (1/2: same favourite; 1X/X2/12: 60%+; GG/NG: 50%+ from the goal model)
@@ -1797,7 +1803,7 @@ function comboScore(m, st, minConf = 0, allow = null) {
   const tired = side && side.restDays != null && side.restDays < 3 ? 0.02 : 0;
   const split = goals ? 0 : (st.form && !supports(st.form) ? 0.05 : 0) + (st.ai && !supports(st.ai.probs) ? 0.02 : 0);
   const dis = st.disagree != null ? DISAGREE_PENALTY * Math.max(0, st.disagree - 0.05) : 0;
-  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis - injPenalty(st, pick.k) };
+  return { pick, agreeN, total: srcs.length, score: pick.p + 0.06 * agree + edge - tired - split - dis - injPenalty(st, pick.k) - leaguePen(m) };
 }
 
 async function dayCached(key, raw, okFn) {
@@ -2114,7 +2120,7 @@ async function renderStats() {
     t += '\n\n🌍 <b>By league</b> (published picks)\n';
     for (const [c, v] of lg) {
       const hit = v.filter((x) => pickOf(x) === x.res).length;
-      t += `• ${esc(LEAGUE_NAMES[c] || ESPN_LEAGUES[String(c).replace(/^X:/, '')] || c)}: ${hit}/${v.length} (${pct(hit / v.length)}%)\n`;
+      t += `• ${esc(LEAGUE_NAMES[c] || ESPN_LEAGUES[String(c).replace(/^X:/, '')] || c)}: ${hit}/${v.length} (${pct(hit / v.length)}%)${leagueGated(c) ? ' ⚠️ under review' : ''}\n`;
     }
   }
   const tw = tuneWeights(done);
@@ -2315,6 +2321,10 @@ async function initDb() {
     code TEXT, user_id BIGINT, redeemed_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (code, user_id))`);
   await q(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
   await q(`CREATE TABLE IF NOT EXISTS odds_cache (key TEXT PRIMARY KEY, data JSONB NOT NULL, at BIGINT NOT NULL)`);
+  await q(`ALTER TABLE watch ADD COLUMN IF NOT EXISTS last_score TEXT`);
+  await q(`CREATE TABLE IF NOT EXISTS subs (
+    user_id BIGINT PRIMARY KEY, plan TEXT NOT NULL, auth_code TEXT NOT NULL, email TEXT NOT NULL, last4 TEXT,
+    active BOOLEAN DEFAULT true, fails INT DEFAULT 0, last_try TIMESTAMPTZ, notified_until TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
   dbReady = true;
 }
 
@@ -2598,7 +2608,7 @@ async function onStarsPaid(ctx) {
 }
 
 // --- Paystack (NGN) ---
-async function paystackInit(u, planKey) {
+async function paystackInit(u, planKey, opts = {}) {
   const plan = PLANS[planKey];
   const ref = `fb_${u.id}_${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`;
   const res = await fetchRetry('https://api.paystack.co/transaction/initialize', {
@@ -2610,7 +2620,8 @@ async function paystackInit(u, planKey) {
       currency: 'NGN',
       reference: ref,
       callback_url: PUBLIC_URL ? `${PUBLIC_URL}/paystack/callback` : undefined,
-      metadata: { user_id: u.id, plan: planKey },
+      metadata: { user_id: u.id, plan: planKey, ...(opts.auto ? { auto: true } : {}) },
+      ...(opts.auto ? { channels: ['card'] } : {}), // only cards can be charged again
     }),
   }, 30000, 2);
   const j = await res.json().catch(() => ({}));
@@ -2634,6 +2645,12 @@ async function settlePaystack(ref) {
   const upd = await q(`UPDATE payments SET status = 'success' WHERE ref = $1 AND status <> 'success' RETURNING id`, [ref]);
   if (!upd.rows.length) return { ok: true, already: true }; // webhook + button raced; only one activates
   await activatePlan(p.user_id, p.plan, 'Paystack', p.amount, 'NGN');
+  const md = d.metadata || {};
+  if ((md.auto === true || md.auto === 'true') && !md.renewal && AUTORENEW_PLANS.includes(p.plan)) { // opted in at checkout: remember the card token
+    try {
+      if (await saveSub(p.user_id, p.plan, d)) await sendTo(p.user_id, `🔁 <b>Auto-renew is ON</b> (${esc(PLANS[p.plan].label)}, ₦${money(PLANS[p.plan].ngn)} every ${PLANS[p.plan].days} days).\nI'll remind you 24 hours before each charge. Stop it any time with /cancel — you keep access until the end of the paid period.`);
+    } catch (e) { console.log('Saving subscription failed:', e.message); }
+  }
   return { ok: true };
 }
 if (PAYSTACK_KEY) {
@@ -3547,6 +3564,8 @@ async function renderAccount(ctx) {
   tx += ctx.isAdmin ? '🛡 Plan: <b>Admin — all features unlocked</b>\n' : `⭐ Plan: <b>${ctx.premium ? t(u, 'plan_active', fmtUntil(u.plan_until)) : t(u, 'plan_free')}</b>\n`;
   if (!ctx.premium) tx += `🆓 Free analyses today: ${Math.min(used, FREE_DAILY_LIMIT)}/${FREE_DAILY_LIMIT}\n`;
   tx += `🔔 Daily picks: ${u.sub_daily ? 'ON' : 'off'}\n👥 Referrals: ${refs}\n`;
+  const sub = (await q('SELECT * FROM subs WHERE user_id = $1 AND active', [u.id]).catch(() => ({ rows: [] }))).rows[0];
+  if (sub) tx += `🔁 Auto-renew: <b>ON</b> (${esc((PLANS[sub.plan] || {}).label || sub.plan)}${sub.last4 ? ', card •••• ' + esc(sub.last4) : ''}) — /cancel to stop\n`;
   if (u.excluded_until && new Date(u.excluded_until) > new Date()) tx += `⛔ Self-exclusion until ${fmtUntil(u.excluded_until)}\n`;
   tx += '\n🎟 /redeem a promo code · 🎁 /refer for free days · 📌 /myrecord · 🛡 /responsible';
   return tx;
@@ -3595,7 +3614,7 @@ function premiumView(u) {
     '🏆 Top 5 · 💎 Best 3 · 🥇 Best 1\n🔟⭐ Best 10 Pro · 🌟 Pick of the Week\n📈 Value · ⚽ Goals · 🛡 Double chance · 🎯 Correct score\n🎯 Accas · 🛡 Safe slip · 🏖 Weekend special\n🔔 Daily push + kickoff, result &amp; price-move alerts\n♾ Unlimited match analysis and /predict\n\n';
   if (proof) tx += proof + '\n<i>Past results don\'t guarantee future results.</i>\n\n';
   tx += keys.map((k) => `${icon[k] || '⭐'} <b>${PLANS[k].label}</b> (${PLANS[k].days} day${PLANS[k].days > 1 ? 's' : ''}) — ${price(k)}${k !== 'day' && save(k) > 0 ? ` · <i>save ${save(k)}%</i>` : ''}`).join('\n');
-  tx += '\n\n🎁 Earn free days with /refer · 🎟 Have a promo code? /redeem';
+  tx += '\n\n🎁 Earn free days with /refer · 🎟 Have a promo code? /redeem' + (PAYSTACK_KEY ? '\n🔁 Weekly / Monthly can auto-renew by card — cancel any time with /cancel' : '');
   const rows = buyRows();
   rows.push([Markup.button.callback('🎟 Promo code', 'redeem'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
@@ -3658,6 +3677,7 @@ function buyRows() {
     if (PAYSTACK_KEY) row.push(Markup.button.callback(`💳 ${p.label} · ₦${money(p.ngn)}`, `buy:ps:${k}`));
     if (row.length) rows.push(row);
   }
+  if (PAYSTACK_KEY) for (const k of AUTORENEW_PLANS) if (PLANS[k]) rows.push([Markup.button.callback(`🔁 ${PLANS[k].label} auto-renew · ₦${money(PLANS[k].ngn)}`, `buy:ar:${k}`)]);
   return rows;
 }
 function renewKb() {
@@ -4079,7 +4099,7 @@ async function kickoffTick() {
 }
 async function expiryTick() {
   // 24h before the end: one-tap renew buttons
-  const { rows } = await q(`SELECT * FROM users WHERE plan_until BETWEEN now() AND now() + interval '24 hours' AND NOT warned_exp AND NOT blocked`);
+  const { rows } = await q(`SELECT * FROM users WHERE plan_until BETWEEN now() AND now() + interval '24 hours' AND NOT warned_exp AND NOT blocked AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.user_id = users.id AND s.active)`);
   for (const u of rows) {
     await q('UPDATE users SET warned_exp = true WHERE id = $1', [u.id]);
     await sendTo(u.id, t(u, 'exp_warn', fmtUntil(u.plan_until)) + '\n\n👇 Renew in one tap:', { reply_markup: renewKb().reply_markup });
@@ -4367,6 +4387,208 @@ async function channelTick() {
   }
 }
 
+// =====================================================================
+//  FEATURE PACK 3 — league gating, auto-renew, live goal alerts, backups
+// =====================================================================
+const zlib = require('zlib');
+
+// ----- Per-league performance gating -----
+// A league with 30+ settled published picks and a clearly negative ROI (or a hit rate far under the confidence we claimed) is penalised
+// in the rankings (LEAGUE_GATE=penalty, default), excluded from ranked lists (=exclude) or ignored (=off). Re-evaluated from your own log every 15 min.
+const LEAGUE_GATE_MODE = (process.env.LEAGUE_GATE || 'penalty').toLowerCase();
+const LEAGUE_GATE_MIN = Number(process.env.LEAGUE_GATE_MIN || 30);
+const LEAGUE_GATE_ROI = Number(process.env.LEAGUE_GATE_ROI || -0.1);
+const LEAGUE_GATE_PENALTY = Number(process.env.LEAGUE_GATE_PENALTY || 0.05);
+let leagueCache = { at: 0, map: new Map() };
+function leagueTable() {
+  if (Date.now() - leagueCache.at < 15 * 60e3) return leagueCache.map;
+  const map = new Map();
+  for (const r of predLog) {
+    if (!r.res || !r.final || !r.tags || !r.tags.length) continue;
+    const k = pickOf(r);
+    const e = map.get(r.comp) || { n: 0, w: 0, conf: 0, priced: 0, profit: 0 };
+    const win = k === r.res;
+    e.n++; if (win) e.w++; e.conf += r.final[k] || 0;
+    const o = pubOddsOf(r, k);
+    if (o) { e.priced++; e.profit += win ? o - 1 : -1; }
+    map.set(r.comp, e);
+  }
+  for (const e of map.values()) {
+    e.rate = e.w / e.n; e.avgConf = e.conf / e.n;
+    e.roi = e.priced >= Math.ceil(e.n * 0.5) ? e.profit / e.priced : null;
+    e.gated = e.n >= LEAGUE_GATE_MIN && ((e.roi != null && e.roi < LEAGUE_GATE_ROI) || e.rate < e.avgConf - 0.12);
+  }
+  leagueCache = { at: Date.now(), map };
+  return map;
+}
+const leagueGated = (comp) => LEAGUE_GATE_MODE !== 'off' && !!(leagueTable().get(comp) || {}).gated;
+const leaguePen = (m) => (LEAGUE_GATE_MODE === 'penalty' && leagueGated(m.comp) ? LEAGUE_GATE_PENALTY : 0);
+const leagueName = (c) => LEAGUE_NAMES[c] || ESPN_LEAGUES[String(c).replace(/^X:/, '')] || String(c).replace(/^X:(odds|sdb):/, '');
+
+// ----- Auto-renewing Paystack subscriptions (opt-in at checkout, card only, cancel any time) -----
+// We keep Paystack's reusable card token and charge it ourselves ~2h before the plan ends, so amounts always follow PLANS.
+const AUTORENEW_PLANS = ['week', 'month'];
+async function saveSub(userId, planKey, d) {
+  const a = d.authorization || {};
+  if (!a.authorization_code || a.reusable === false) return false;
+  const email = (d.customer && d.customer.email) || `tg${userId}@${PAYSTACK_EMAIL_DOMAIN}`;
+  await q(`INSERT INTO subs (user_id, plan, auth_code, email, last4, active, fails) VALUES ($1, $2, $3, $4, $5, true, 0)
+    ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan, auth_code = EXCLUDED.auth_code, email = EXCLUDED.email, last4 = EXCLUDED.last4, active = true, fails = 0`,
+    [userId, planKey, a.authorization_code, email, a.last4 || null]);
+  return true;
+}
+async function renewTick() {
+  if (!PAYSTACK_KEY) return;
+  // 24h reminder before each automatic charge
+  const warn = (await q(`SELECT s.user_id, s.plan, s.last4, u.plan_until FROM subs s JOIN users u ON u.id = s.user_id
+    WHERE s.active AND u.plan_until BETWEEN now() AND now() + interval '24 hours' AND s.notified_until IS DISTINCT FROM u.plan_until`)).rows;
+  for (const w of warn) {
+    const plan = PLANS[w.plan];
+    await q('UPDATE subs SET notified_until = (SELECT plan_until FROM users WHERE id = $1) WHERE user_id = $1', [w.user_id]);
+    if (!plan) continue;
+    await sendTo(w.user_id, `🔁 <b>Auto-renew reminder</b>\nYour ${esc(plan.label)} plan ends ${fmtUntil(w.plan_until)}. ₦${money(plan.ngn)} will be charged to your card${w.last4 ? ' ending ' + esc(w.last4) : ''} shortly before.\nDon't want it? /cancel`);
+    await sleep(40);
+  }
+  // charge
+  const due = (await q(`SELECT s.*, u.plan_until FROM subs s JOIN users u ON u.id = s.user_id
+    WHERE s.active AND u.plan_until <= now() + interval '2 hours' AND (s.last_try IS NULL OR s.last_try < now() - interval '8 hours') AND s.fails < 3
+    AND NOT u.banned AND (u.excluded_until IS NULL OR u.excluded_until <= now())`)).rows;
+  for (const s0 of due) {
+    const plan = PLANS[s0.plan];
+    if (!plan) { await q('UPDATE subs SET active = false WHERE user_id = $1', [s0.user_id]); continue; }
+    await q('UPDATE subs SET last_try = now() WHERE user_id = $1', [s0.user_id]);
+    const ref = `fbr_${s0.user_id}_${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`;
+    await q(`INSERT INTO payments (user_id, provider, ref, plan, amount, currency, status) VALUES ($1, 'paystack', $2, $3, $4, 'NGN', 'pending')`, [s0.user_id, ref, s0.plan, plan.ngn]);
+    let ok = false, why = '';
+    try {
+      const res = await fetchRetry('https://api.paystack.co/transaction/charge_authorization', { // single attempt on purpose: a retry could double-charge
+        method: 'POST', headers: { Authorization: `Bearer ${PAYSTACK_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ authorization_code: s0.auth_code, email: s0.email, amount: Math.round(plan.ngn * 100), currency: 'NGN', reference: ref, metadata: { user_id: s0.user_id, plan: s0.plan, auto: true, renewal: true } }),
+      }, 30000, 1);
+      const j = await res.json().catch(() => ({}));
+      if (j.status && j.data && j.data.status === 'success') ok = (await settlePaystack(ref)).ok;
+      else why = (j.data && (j.data.gateway_response || j.data.status)) || j.message || 'declined';
+    } catch (e) { why = e.message; } // outcome unknown: a late webhook / recheck can still settle the pending payment
+    if (ok) { await q('UPDATE subs SET fails = 0 WHERE user_id = $1', [s0.user_id]); continue; }
+    await q(`UPDATE payments SET status = 'failed' WHERE ref = $1 AND status = 'pending'`, [ref]);
+    const fails = (await q('UPDATE subs SET fails = fails + 1, active = (fails + 1 < 3) WHERE user_id = $1 RETURNING fails, active', [s0.user_id])).rows[0];
+    console.log('Auto-renew failed for', s0.user_id, '-', why);
+    await sendTo(s0.user_id, `⚠️ <b>Auto-renew failed</b> (${esc(String(why).slice(0, 80))}).` + (fails && !fails.active ? '\nAuto-renew has been switched off after 3 failed attempts.' : '\nI will try again later.') + '\n\n👇 Renew manually:', { reply_markup: renewKb().reply_markup });
+    await sleep(40);
+  }
+}
+
+// ----- Live goal alerts for watchlist matches (free score feeds, no API credits) -----
+async function goalTick() {
+  const now = Date.now();
+  const rows = (await q(`SELECT w.* FROM watch w JOIN users u ON u.id = w.user_id WHERE NOT w.res_sent AND w.utc < $1 AND w.utc > $2 AND NOT u.blocked
+    AND (u.excluded_until IS NULL OR u.excluded_until <= now())`, [now + 5 * 60e3, now - 4 * 3600e3])).rows;
+  if (!rows.length) return;
+  const slugOf = (c) => (String(c).startsWith('X:') ? (ESPN_LEAGUES[String(c).slice(2)] ? String(c).slice(2) : null) : FD_TO_ESPN[c] || null);
+  const slugs = new Set();
+  let needAll = false;
+  for (const w of rows) { const sl = slugOf(w.comp); if (sl) slugs.add(sl); else needAll = true; }
+  const games = [];
+  const early = new Date().getUTCHours() < 6;
+  await pool([...slugs], 4, async (slug) => {
+    const days = [ymd(now)];
+    if (early || AMERICAS_RE.test(slug)) days.push(ymd(now - 864e5));
+    for (const d of days) {
+      try { games.push(...(await cached(`goalfeed:${slug}:${d}`, 40e3, async () => ((await espnJson(slug, d)).events || []).map((ev) => espnGame(ev, slug)).filter(Boolean)))); }
+      catch (e) { if (!e.missing) console.log('Goal feed failed', slug, e.message); }
+    }
+  });
+  if (needAll) { try { games.push(...(await getGames()).games); } catch (e) { /* no feed reachable */ } }
+  const sameTeams = (w, g) => (nameScore(w.home, g.home) >= 0.99 || nameScore(w.home, g.homeFull) >= 0.99) && (nameScore(w.away, g.away) >= 0.99 || nameScore(w.away, g.awayFull) >= 0.99);
+  for (const w of rows) {
+    const g = games.find((x) => x.status !== 'NS' && Math.abs(x.utc - w.utc) < 8 * 3600e3 && sameTeams(w, x));
+    if (!g || g.hs == null || g.as == null) continue;
+    const r = predById.get(w.match_id);
+    const k = r && r.final ? argmax(r.final) : null;
+    if (g.status === 'FT') {
+      const hs = g.hs90 != null ? g.hs90 : g.hs, as = g.as90 != null ? g.as90 : g.as;
+      const res = hs > as ? 'H' : hs < as ? 'A' : 'D';
+      const claim = await q('UPDATE watch SET res_sent = true, last_score = $3 WHERE user_id = $1 AND match_id = $2 AND NOT res_sent RETURNING user_id', [w.user_id, w.match_id, `${g.hs}-${g.as}`]);
+      if (!claim.rows.length) continue;
+      await sendTo(w.user_id, `🏁 <b>Full time</b> — ${esc(w.home)} <b>${g.hs}-${g.as}</b> ${esc(w.away)}${g.aet ? ' (after extra time)' : ''}` + (k && g.hs90 != null ? `\nOur lean (${sign1x2[k]}): ${k === res ? '✅ correct' : '❌ missed'}` : ''));
+      await sleep(40);
+      continue;
+    }
+    const cur = `${g.hs}-${g.as}`;
+    if (w.last_score == null && g.hs + g.as === 0) { await q('UPDATE watch SET last_score = $3 WHERE user_id = $1 AND match_id = $2 AND last_score IS NULL', [w.user_id, w.match_id, cur]); continue; }
+    const claim = await q('UPDATE watch SET last_score = $3 WHERE user_id = $1 AND match_id = $2 AND last_score IS DISTINCT FROM $3 RETURNING user_id', [w.user_id, w.match_id, cur]);
+    if (!claim.rows.length) continue;
+    const prev = w.last_score && /^(\d+)-(\d+)$/.exec(w.last_score);
+    const total = g.hs + g.as, was = prev ? Number(prev[1]) + Number(prev[2]) : -1;
+    const head = prev && total < was ? '🔁 <b>Score corrected</b>' : prev || total === 0 ? '⚽ <b>GOAL!</b>' : '📣 <b>Score update</b>';
+    await sendTo(w.user_id, `${head} ${esc(w.home)} <b>${g.hs}-${g.as}</b> ${esc(w.away)}${g.minute ? ' · ' + esc(g.minute) : ''}` + (w.lean ? `\n🎯 Our lean: ${esc(w.lean)}` : ''));
+    await sleep(40);
+  }
+}
+
+// ----- Backups (JSON, gzipped) — weekly to every admin, or on demand with /backup. subs (card tokens) are never included. -----
+const BACKUP_TABLES = ['users', 'payments', 'usage', 'watch', 'predictions', 'followed', 'promo_codes', 'promo_redemptions', 'settings'];
+const BACKUP_DAYS = Number(process.env.BACKUP_DAYS || 7);
+async function buildBackup() {
+  const out = { v: 1, at: new Date().toISOString(), tables: {} };
+  for (const t0 of BACKUP_TABLES) out.tables[t0] = (await q(`SELECT COALESCE(jsonb_agg(to_jsonb(x)), '[]'::jsonb) AS d FROM ${t0} x`)).rows[0].d;
+  const rows = Object.values(out.tables).reduce((a, r) => a + r.length, 0);
+  return { buf: zlib.gzipSync(Buffer.from(JSON.stringify(out))), rows };
+}
+const backupName = () => `footballbot-backup-${new Date().toISOString().slice(0, 10)}.json.gz`;
+async function backupTick() {
+  if (!ADMIN_IDS.length) return;
+  const last = Number(await getSetting('last_backup')) || 0;
+  if (Date.now() - last < BACKUP_DAYS * 864e5) return;
+  const { buf, rows } = await buildBackup();
+  let sent = 0;
+  for (const id of ADMIN_IDS) { try { await bot.telegram.sendDocument(id, { source: buf, filename: backupName() }, { caption: `💾 Weekly backup · ${rows} rows · ${Math.round(buf.length / 1024)} KB` }); sent++; } catch (e) { console.log('Backup send failed for', id, e.message); } }
+  if (sent) await setSetting('last_backup', String(Date.now()));
+}
+async function restoreBackup(buf) {
+  let raw = buf;
+  try { raw = zlib.gunzipSync(buf); } catch (e) { /* maybe plain JSON */ }
+  const j = JSON.parse(raw.toString('utf8'));
+  if (!j || !j.tables) throw new Error('not a backup file');
+  const counts = {};
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    for (const t0 of BACKUP_TABLES) {
+      const rows = j.tables[t0];
+      if (!Array.isArray(rows) || !rows.length) continue;
+      const r = await client.query(`INSERT INTO ${t0} SELECT * FROM jsonb_populate_recordset(NULL::${t0}, $1::jsonb) ON CONFLICT DO NOTHING`, [JSON.stringify(rows)]);
+      counts[t0] = r.rowCount;
+    }
+    await client.query(`SELECT setval(pg_get_serial_sequence('payments', 'id'), COALESCE((SELECT max(id) FROM payments), 1))`);
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+  await loadPredLog().catch(() => {}); await loadFree().catch(() => {});
+  return counts;
+}
+
+// ----- Webhook mode (no polling = no 409 conflicts during deploys) -----
+async function startWebhook(allowed) {
+  bot.botInfo = await bot.telegram.getMe();
+  tgWebhook = (req, res) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size > 2e6) req.destroy(); else chunks.push(c); });
+    req.on('end', () => {
+      const got = String(req.headers['x-telegram-bot-api-secret-token'] || '');
+      let ok = false;
+      try { ok = got.length === TG_SECRET.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(TG_SECRET)); } catch (e) { /* mismatch */ }
+      if (!ok) { res.writeHead(401); return res.end(); }
+      res.writeHead(200); res.end('ok'); // answer first, process after: Telegram never waits on slow AI jobs
+      try { bot.handleUpdate(JSON.parse(Buffer.concat(chunks).toString('utf8'))).catch((e) => console.error('Update failed:', e)); }
+      catch (e) { console.log('Bad webhook body:', e.message); }
+    });
+  };
+  await bot.telegram.setWebhook(PUBLIC_URL + TG_PATH, { secret_token: TG_SECRET, allowed_updates: allowed, max_connections: 40 });
+  const info = await bot.telegram.getWebhookInfo();
+  console.log(`Webhook set: ${PUBLIC_URL}/tg/… · pending ${info.pending_update_count}${info.last_error_message ? ' · last error: ' + info.last_error_message : ''}`);
+}
+
 let tickN = 0, ticking = false;
 async function schedulerTick() {
   if (ticking || !dbReady) return;
@@ -4383,6 +4605,9 @@ async function schedulerTick() {
     if (tickN % 5 === 2) await clvTick().catch((e) => console.log('CLV tick failed:', e.message));
     if (tickN % 5 === 3) await channelTick().catch((e) => { chanBackoff = Date.now() + 10 * 60e3; console.log('Channel tick failed:', e.message); });
     if (tickN % 60 === 7) await autoTuneTick().catch((e) => console.log('Auto-tune failed:', e.message));
+    if (tickN % 2 === 1) await goalTick().catch((e) => console.log('Goal tick failed:', e.message));
+    if (tickN % 10 === 4) await renewTick().catch((e) => console.log('Renew tick failed:', e.message));
+    if (tickN % 60 === 11) await backupTick().catch((e) => console.log('Backup tick failed:', e.message));
   } catch (e) { console.log('Scheduler error:', e.message); }
   ticking = false;
 }
@@ -4400,6 +4625,47 @@ const editOrReply = async (ctx, text, kb) => {
   try { await ctx.editMessageText(text, { ...HTML, ...(kb || {}) }); }
   catch (e) { if (!/not modified/i.test(e.message)) await reply(ctx, text, kb); }
 };
+
+// ----- per-user rate limit (token bucket). Heavy actions (AI / API work) cost more than a simple tap. Admins are exempt. -----
+const RATE_ON = process.env.RATE_LIMIT !== 'off';
+const RATE_CAP = Number(process.env.RATE_BUCKET || 20);                       // burst size (tokens)
+const RATE_REFILL = Number(process.env.RATE_REFILL_PER_MIN || 20) / 60e3;     // tokens per millisecond
+const RATE_HEAVY = Number(process.env.RATE_HEAVY_COST || 4);
+const HEAVY_CMD = new Set(['top5', 'best3', 'best1', 'best10', 'best10pro', 'vip', 'week', 'weekly', 'smart', 'smart10', 'smart5', 'smart3', 'value', 'goals', 'dc', 'scores', 'safe', 'weekend', 'acca', 'predict', 'market', 'result', 'htft', 'combos', 'handicaps', 'live', 'stats', 'potw', 'calibration', 'sections', 'sectionstats']);
+const HEAVY_TXT = new Set(['🏆 Top 5', '🔟 Best 10', '💎 Best 3', '📈 Value', '🎯 Acca', '🔴 Live']);
+const HEAVY_CB = /^(top5|best3|best1|best10|best10pro|vip|week|smart\d+|value|goals|dc|scores|safe|weekend|potw|live|sec|trk)$|^(wk:|wkset:|acca:|mk:|am:|m:\d|h2h:)/;
+const rateBuckets = new Map();
+function rateCost(ctx) {
+  const txt = ctx.message && ctx.message.text;
+  if (txt) { const c = /^\/(\w+)/.exec(txt); return (c ? HEAVY_CMD.has(c[1].toLowerCase()) : HEAVY_TXT.has(txt)) ? RATE_HEAVY : 1; }
+  const cb = ctx.callbackQuery && ctx.callbackQuery.data;
+  return cb && HEAVY_CB.test(cb) ? RATE_HEAVY : 1;
+}
+setInterval(() => { const cut = Date.now() - 30 * 60e3; for (const [k, b] of rateBuckets) if (b.at < cut && b.blockedUntil < Date.now()) rateBuckets.delete(k); }, 10 * 60e3).unref();
+bot.use(async (ctx, next) => {
+  if (!RATE_ON || !ctx.from || ctx.from.is_bot || isAdminId(ctx.from.id) || ctx.preCheckoutQuery || (ctx.message && ctx.message.successful_payment)) return next();
+  const now = Date.now();
+  let b = rateBuckets.get(ctx.from.id);
+  if (!b) { b = { tokens: RATE_CAP, at: now, strikes: 0, strikeAt: 0, blockedUntil: 0, warnedAt: 0 }; rateBuckets.set(ctx.from.id, b); }
+  b.tokens = Math.min(RATE_CAP, b.tokens + (now - b.at) * RATE_REFILL); b.at = now;
+  const cost = rateCost(ctx);
+  const blocked = now < b.blockedUntil;
+  if (blocked || b.tokens < cost) {
+    if (!blocked) {
+      if (now - b.strikeAt > 10 * 60e3) b.strikes = 0;
+      b.strikes++; b.strikeAt = now;
+      if (b.strikes >= 6) { b.blockedUntil = now + 5 * 60e3; console.log('Rate limit: pausing user', ctx.from.id, 'for 5 min'); }
+    }
+    const wait = Math.max(1, Math.ceil((Math.max(b.blockedUntil, now) > now ? b.blockedUntil - now : (cost - b.tokens) / RATE_REFILL) / 1000));
+    const note = `⏳ Too many requests — please wait ${wait >= 60 ? Math.ceil(wait / 60) + ' min' : wait + 's'}.`;
+    if (ctx.callbackQuery) return ctx.answerCbQuery(note).catch(() => {});
+    if (ctx.inlineQuery) return;
+    if (ctx.message && now - b.warnedAt > 8000) { b.warnedAt = now; return ctx.reply(note).catch(() => {}); }
+    return;
+  }
+  b.tokens -= cost;
+  return next();
+});
 
 // ----- users + access -----
 bot.use(async (ctx, next) => {
@@ -4904,7 +5170,7 @@ bot.on('inline_query', async (ctx) => {
 // ----- admin tools (admins have every feature, no limits) -----
 const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
-  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/free – choose which Premium features are free\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion\n/autotune [on|off|now|reset] – weight auto-tuning\n/channel [test|results] – public channel posts';
+  '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/free – choose which Premium features are free\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion\n/autotune [on|off|now|reset] – weight auto-tuning\n/channel [test|results] – public channel posts\n/backup · /restore – database backup (send the file with caption <code>/restore YES</code>)\n/leaguestats – per-league results &amp; gating\n/subs – auto-renew subscriptions\n/webhook – Telegram webhook status';
 bot.command('admin', adminOnly((ctx) => showAdmin(ctx)));
 bot.command('dupes', adminOnly(async (ctx) => { // same match logged twice under different names/competitions
   const rows = predLog.filter((r) => r.utc > Date.now() - 30 * 864e5), out = [];
@@ -5373,6 +5639,66 @@ bot.command('channel', adminOnly(detach(async (ctx) => {
 })));
 bot.command('apistatus', adminOnly(async (ctx) => reply(ctx, `🔌 <b>Optional feeds</b>\nInjuries (API-Football): ${API_FB_KEY ? 'key set · ' + apiFb.n + '/' + API_FB_MAX_DAY + ' requests today' + (apiFb.err ? ' · last error: ' + esc(apiFb.err) : '') : 'no key (API_FOOTBALL_KEY)'}\nGoal-market prices: ${GOALS_ODDS_ON ? 'ON · ' + gxDay.n + '/' + GOALS_ODDS_MAX + ' matches today' : 'off (GOALS_ODDS=on)'}\nCLV tracking: ${CLV_ON ? 'on' : 'off'} · ${predLog.filter((r) => r.close).length} closing prices stored\nSaved odds snapshots window: ${Math.round(ODDS_PERSIST_MS / 60e3)} min`)));
 
+// ----- auto-renew: opt-in checkout + /cancel -----
+bot.action(/^buy:ar:(week|month)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!PAYSTACK_KEY) return;
+  const planKey = ctx.match[1], plan = PLANS[planKey];
+  try {
+    const { url, ref } = await paystackInit(ctx.u, planKey, { auto: true });
+    await reply(ctx, `🔁 <b>${esc(plan.label)} auto-renew — ₦${money(plan.ngn)} every ${plan.days} days</b>\nPay now with your card. After that the same card is charged ₦${money(plan.ngn)} shortly before each period ends. You get a reminder 24 hours before every charge and can stop any time with /cancel (access stays until the paid period ends).\n\n<i>By paying you agree to these recurring charges.</i>`,
+      Markup.inlineKeyboard([[Markup.button.url('💳 Pay & enable auto-renew', url)], [Markup.button.callback('✅ I have paid', `pv:${ref}`)]]));
+  } catch (e) { console.error(e); await ctx.reply('⚠️ Could not start the Paystack checkout. Please try again shortly.'); }
+});
+const cancelRenew = async (ctx) => {
+  const r = await q('UPDATE subs SET active = false WHERE user_id = $1 AND active RETURNING plan', [ctx.u.id]);
+  return reply(ctx, r.rows.length ? `✅ <b>Auto-renew cancelled.</b> You will not be charged again. Premium stays active until ${ctx.u.plan_until ? fmtUntil(ctx.u.plan_until) : 'the end of your paid period'}.` : 'ℹ️ You have no active auto-renew subscription.');
+};
+bot.command(['cancel', 'cancelrenewal'], cancelRenew);
+bot.action('subcancel', answered(cancelRenew));
+
+// ----- admin: backup / restore / league stats / subs / webhook -----
+bot.command('backup', adminOnly(detach(async (ctx) => {
+  try {
+    const { buf, rows } = await buildBackup();
+    await ctx.replyWithDocument({ source: buf, filename: backupName() }, { caption: `💾 Backup · ${rows} rows · ${Math.round(buf.length / 1024)} KB\nRestore: send this file back with the caption /restore YES (only adds missing rows).` });
+  } catch (e) { console.error(e); await reply(ctx, '⚠️ Backup failed: ' + esc(e.message)); }
+})));
+bot.on('document', async (ctx, next) => {
+  if (!ctx.isAdmin) return next();
+  const cap = (ctx.message.caption || '').trim();
+  if (!/^\/restore\b/i.test(cap)) return next();
+  if (!/^\/restore\s+yes\b/i.test(cap)) return void (await reply(ctx, '⚠️ To restore, send the backup file with the caption <code>/restore YES</code>.\nIt only ADDS rows that are missing — existing rows are never overwritten.'));
+  try {
+    const doc = ctx.message.document;
+    if (doc.file_size && doc.file_size > 19 * 1024 * 1024) return void (await reply(ctx, '⚠️ Telegram only lets bots download files up to 20 MB.'));
+    const link = await ctx.telegram.getFileLink(doc.file_id);
+    const res = await fetchRetry(String(link), {}, 60000, 2);
+    if (!res.ok) throw new Error('download HTTP ' + res.status);
+    const counts = await restoreBackup(Buffer.from(await res.arrayBuffer()));
+    await reply(ctx, '✅ <b>Restore finished</b> (rows added):\n' + (Object.entries(counts).map(([k, v]) => `• ${k}: ${v}`).join('\n') || 'nothing new — the database already had everything.'));
+  } catch (e) { console.error(e); await reply(ctx, '⚠️ Restore failed (nothing was changed): ' + esc(e.message)); }
+});
+bot.command('leaguestats', adminOnly(async (ctx) => {
+  const rows = [...leagueTable().entries()].sort((a, b) => b[1].n - a[1].n);
+  if (!rows.length) return reply(ctx, '🌍 No settled published picks yet.');
+  let tx = `🌍 <b>League performance</b> (published picks)\nGate mode: <b>${esc(LEAGUE_GATE_MODE)}</b> · needs ${LEAGUE_GATE_MIN}+ settled picks and ROI under ${pct(LEAGUE_GATE_ROI)}% or a hit rate 12+ points under the claimed confidence\n\n`;
+  for (const [c, e] of rows.slice(0, 30)) tx += `${e.gated ? '⚠️' : '✅'} ${esc(leagueName(c))}: ${e.w}/${e.n} (${pct(e.rate)}%) · claimed ${pct(e.avgConf)}%` + (e.roi != null ? ` · ROI ${signed(e.roi * 100, 0)}%` : '') + '\n';
+  return reply(ctx, tx);
+}));
+bot.command('subs', adminOnly(async (ctx) => {
+  const s = (await q(`SELECT count(*) FILTER (WHERE active)::int AS active, count(*) FILTER (WHERE NOT active)::int AS off, count(*) FILTER (WHERE active AND fails > 0)::int AS failing FROM subs`)).rows[0];
+  const by = (await q(`SELECT plan, count(*)::int AS n FROM subs WHERE active GROUP BY plan`)).rows;
+  const next = (await q(`SELECT s.user_id, s.plan, u.plan_until FROM subs s JOIN users u ON u.id = s.user_id WHERE s.active ORDER BY u.plan_until LIMIT 8`)).rows;
+  return reply(ctx, `🔁 <b>Auto-renew</b>\nActive ${s.active} (${by.map((x) => x.plan + ' ×' + x.n).join(' · ') || '—'}) · cancelled/failed ${s.off} · currently failing ${s.failing}\n\nNext renewals:\n` + (next.map((x) => `• <code>${x.user_id}</code> ${esc(x.plan)} — ${fmtDate(x.plan_until)} ${fmtTime(new Date(x.plan_until).getTime())}`).join('\n') || '—'));
+}));
+bot.command('webhook', adminOnly(async (ctx) => {
+  try {
+    const i = await bot.telegram.getWebhookInfo();
+    return reply(ctx, `🔌 <b>Telegram updates</b>: ${i.url ? 'webhook' : 'polling'}\n` + (i.url ? `Pending: ${i.pending_update_count}\n${i.last_error_message ? 'Last error: ' + esc(i.last_error_message) + ' (' + fmtDate(i.last_error_date * 1000) + ')\n' : 'No errors.\n'}` : '') + `Mode setting: WEBHOOK=${esc(process.env.WEBHOOK || 'auto')} · public URL: ${PUBLIC_URL ? 'set' : 'NOT set'}`);
+  } catch (e) { return reply(ctx, '⚠️ ' + esc(e.message)); }
+}));
+
 bot.catch((err) => console.error('Bot error:', err));
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
@@ -5409,6 +5735,14 @@ async function main() {
 }
 // Render briefly runs the old and new instance together on deploy -> Telegram answers 409. Wait and retry instead of crashing.
 async function launchBot(attempt = 1) {
+  const wh = (process.env.WEBHOOK || 'auto').toLowerCase(); // auto = webhook when a public URL is known (Render sets one) · on · off
+  if (attempt === 1 && wh !== 'off' && PUBLIC_URL) {
+    try {
+      await startWebhook(['message', 'callback_query', 'inline_query', 'pre_checkout_query']);
+      console.log(`Football bot started (webhook) · AI: ${AI_ON ? PROVIDER + ' (' + HF_MODELS.join(', ') + ')' : 'off (odds + form model only)'}`);
+      return;
+    } catch (e) { console.log('Webhook setup failed - falling back to polling:', e.message); tgWebhook = null; }
+  }
   try {
     await bot.telegram.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
     console.log(`Football bot starting · AI: ${AI_ON ? PROVIDER + ' (' + HF_MODELS.join(', ') + ')' : 'off (odds + form model only)'}`);
