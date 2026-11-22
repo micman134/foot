@@ -114,7 +114,7 @@ const MAX_AI_MATCHES = Number(process.env.MAX_AI_MATCHES || 40); // how many top
 // ----- Model tuning -----
 let W_MKT = Number(process.env.W_MARKET || 0.62);  // market odds are the strongest single signal
 let W_FORM = Number(process.env.W_FORM || 0.30);   // team-rating Poisson model
-const W_AI = Number(process.env.W_AI || 0.15);       // small LLMs are weak at probabilities -> low weight
+const W_AI = Number(process.env.W_AI || 0.05);       // small LLMs scored worst in /stats -> very low weight (was 0.15)
 const AI_MAX_DEV = Number(process.env.AI_MAX_DEV || 0.08); // LLM may move each outcome at most +-8 pts away from the market
 const FORM_HALF_LIFE_DAYS = Number(process.env.FORM_HALF_LIFE_DAYS || 75); // older results count less
 const DC_RHO = Number(process.env.DC_RHO || -0.1);   // Dixon-Coles low-score correction
@@ -481,7 +481,9 @@ const ESPN_TO_ODDS = {
   'arg.1': 'soccer_argentina_primera_division', 'usa.1': 'soccer_usa_mls', 'mex.1': 'soccer_mexico_ligamx',
   'jpn.1': 'soccer_japan_j_league', 'chn.1': 'soccer_china_superleague', 'aus.1': 'soccer_australia_aleague',
   'eng.fa': 'soccer_fa_cup', 'eng.league_cup': 'soccer_efl_cup',
+  'uefa.nations': 'soccer_uefa_nations_league', // so ESPN and the Odds API label the same competition identically
 };
+const ODDS_TO_ESPN = Object.fromEntries(Object.entries(ESPN_TO_ODDS).map(([slug, key]) => [key, slug]));
 const ymd = (ms) => new Date(ms).toISOString().slice(0, 10).replace(/-/g, '');
 const extraIdOf = (espnId) => { // numeric + far above football-data ids so buttons/DB (BIGINT, \d+) keep working
   const n = Number(espnId);
@@ -733,7 +735,7 @@ async function oddsApiEventsDay(today) {
       if (!Number.isFinite(utc) || utc <= Date.now() || localDate(new Date(utc)) !== today) continue;
       out.push({
         id: 7e12 + parseInt(crypto.createHash('md5').update(String(ev.id)).digest('hex').slice(0, 8), 16),
-        comp: 'X:odds:' + sp.key, compName: sp.title || sp.key, slug: null, oddsKey: sp.key, extra: true,
+        comp: ODDS_TO_ESPN[sp.key] ? 'X:' + ODDS_TO_ESPN[sp.key] : 'X:odds:' + sp.key, compName: (ODDS_TO_ESPN[sp.key] && ESPN_LEAGUES[ODDS_TO_ESPN[sp.key]]) || sp.title || sp.key, slug: null, oddsKey: sp.key, extra: true,
         home: ev.home_team, away: ev.away_team, homeFull: ev.home_team, awayFull: ev.away_team, homeId: null, awayId: null, utc, odds: null,
       });
     }
@@ -1193,7 +1195,7 @@ function fitCalibration() {
   }, 0) / rows.length;
   const base = ll(1);
   let best = { T: 1, v: base };
-  for (let T = 0.8; T <= 1.5001; T += 0.02) { const v = ll(T); if (v < best.v) best = { T, v }; }
+  for (let T = 0.6; T <= 1.5001; T += 0.02) { const v = ll(T); if (v < best.v) best = { T, v }; }
   const shrink = rows.length / (rows.length + 100); // trust the fit more as the sample grows
   CAL = { T: 1 + (best.T - 1) * shrink, n: rows.length, fitted: best.T, gain: base - best.v };
   return CAL;
@@ -1540,7 +1542,7 @@ async function computeTop5Raw() {
   withStats.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const top = rank(refined).slice(0, 15);
-  top.forEach((x, i) => { logPrediction(x.m, x.st, i < 5 ? 'top5' : 'best10'); if (i < 10) logPrediction(x.m, x.st, 'pro10'); });
+  if (!tagFrozen('top5')) top.forEach((x, i) => { logPrediction(x.m, x.st, i < 5 ? 'top5' : 'best10'); if (i < 10) logPrediction(x.m, x.st, 'pro10'); }); // tags frozen once per day
   return top;
 }
 const computeTop5 = async () => (await computeRanked()).slice(0, 5);
@@ -1708,7 +1710,7 @@ async function computeBest3Raw() {
   pool0.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const list = rank(refined).slice(0, 3);
-  list.forEach((x, i) => { logPrediction(x.m, x.st, 'best3'); if (i === 0) logPrediction(x.m, x.st, 'best1'); });
+  if (!tagFrozen('best3')) list.forEach((x, i) => { logPrediction(x.m, x.st, 'best3'); if (i === 0) logPrediction(x.m, x.st, 'best1'); });
   return { list, skipped, considered: matches.length };
 }
 
@@ -1827,7 +1829,7 @@ async function computeSmartRaw() {
   withStats.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const top = rank(refined).slice(0, 10);
-  top.forEach((x, i) => logComboPick(x.m, x.st, i < 5 ? 'smart5' : 'smart10'));
+  if (!tagFrozen('smart5')) top.forEach((x, i) => logComboPick(x.m, x.st, i < 5 ? 'smart5' : 'smart10'));
   return top;
 }
 const computeSmart = () => dayCached('smart', computeSmartRaw, (v) => !AI_ON || v.some((x) => x.st.ai));
@@ -1855,7 +1857,7 @@ async function computeSmart3Raw() {
   pool0.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
   const list = rank(refined).slice(0, 3);
-  list.forEach((x) => logComboPick(x.m, x.st, 'smart3'));
+  if (!tagFrozen('smart3')) list.forEach((x) => logComboPick(x.m, x.st, 'smart3'));
   return { list, skipped, considered: matches.length };
 }
 const computeSmart3 = () => dayCached('smart3', computeSmart3Raw, (v) => !AI_ON || v.list.some((x) => x.st.ai));
@@ -1892,7 +1894,7 @@ async function computeWeekRaw() {
     withStats.forEach((x) => logPrediction(x.m, x.st));
     refined.forEach((x) => logPrediction(x.m, x.st));
     const cands = rank(refined, WEEK_FLOOR);
-    cands.filter((x) => x.sc.pick.p > WEEK_MIN_P).slice(0, WEEK_PER_DAY).forEach((x) => logComboPick(x.m, x.st, 'week')); // the default view is what the 'week' stat tracks
+    if (!tagFrozen('week', date)) cands.filter((x) => x.sc.pick.p > WEEK_MIN_P).slice(0, WEEK_PER_DAY).forEach((x) => logComboPick(x.m, x.st, 'week')); // the default view is what the 'week' stat tracks
     days.push({ d, date, considered: ms.length, cands });
   }
   return days;
@@ -2031,14 +2033,30 @@ function tuneWeights(rows) {
   return { ...best, cur, curV: ll(cur), n: r.length };
 }
 
-// Flat 1-unit stake on the model's pick at the average bookmaker price logged at pick time
+// The pick AS PUBLISHED (frozen at the first tag), not whatever the model says now
+const pickOf = (r) => r.pubPick || argmax(r.final);
+const pubOddsOf = (r, k) => ((r.pubOdds || r.odds || {})[k]) || null;
+function ciTxt(w, n) { // 95% Wilson interval for a hit rate
+  if (!n) return '';
+  const z = 1.96, p = w / n, d = 1 + z * z / n;
+  const c = (p + z * z / (2 * n)) / d, m = (z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / d;
+  return ` [95% CI ${pct(Math.max(0, c - m))}–${pct(Math.min(1, c + m))}%]`;
+}
+// True once a section already has tagged picks for that day, so later recomputes cannot add new ones to the record
+function tagFrozen(tag, date = localDate(new Date())) {
+  return predLog.some((r) => r.tags && r.tags.includes(tag) && localDate(new Date(r.utc)) === date);
+}
+
+// Flat 1-unit stake on the PUBLISHED pick at the price logged when it was published
 function roiOf(rows) {
   let n = 0, hit = 0, profit = 0;
   for (const r of rows) {
-    if (!r.odds || !r.final || !r.res) continue;
-    const k = argmax(r.final);
+    if (!r.final || !r.res) continue;
+    const k = pickOf(r);
+    const o = pubOddsOf(r, k);
+    if (!o) continue;
     n++;
-    if (k === r.res) { hit++; profit += r.odds[k] - 1; } else profit -= 1;
+    if (k === r.res) { hit++; profit += o - 1; } else profit -= 1;
   }
   return { n, hit, profit, roi: n ? profit / n : null };
 }
@@ -2053,17 +2071,17 @@ async function renderStats() {
   const done = predLog.filter((r) => r.res && r.mkt && r.final);
   if (done.length < 10)
     return `📉 Only ${done.length} finished predictions logged so far (need 10+). The bot records every match it analyses and checks results itself — try again in a few days.\n\n` + DISCLAIMER;
-  const both = done.filter((r) => r.form);
-  const base = both.length >= 10 ? both : done;
+  // each model is scored on ITS OWN matches, but the difference vs the market is measured on exactly those same matches
   const row = (name, key) => {
-    const r = base.filter((x) => x[key]);
+    const r = done.filter((x) => x[key] && x.mkt);
     if (r.length < 5) return '';
     const acc = r.filter((x) => argmax(x[key]) === x.res).length / r.length;
     const br = r.reduce((s, x) => s + brier(x[key], x.res), 0) / r.length;
+    const bm = r.reduce((s, x) => s + brier(x.mkt, x.res), 0) / r.length;
     const ll = r.reduce((s, x) => s + logloss(x[key], x.res), 0) / r.length;
-    return `• ${name}: ${pct(acc)}% correct · Brier ${br.toFixed(3)} · log-loss ${ll.toFixed(3)} (${r.length})\n`;
+    return `• ${name}: ${pct(acc)}% · Brier ${br.toFixed(3)}${key === 'mkt' ? '' : ' (' + signed(br - bm, 3) + ' vs market)'} · log-loss ${ll.toFixed(3)} (n=${r.length})\n`;
   };
-  let t = `📊 <b>Model scorecard</b> — ${done.length} finished matches\n<i>Lower Brier / log-loss = better calibrated.</i>\n\n`;
+  let t = `📊 <b>Model scorecard</b> — ${done.length} finished matches\n<i>Lower is better. "vs market" is measured on the same matches; negative = beats the market.</i>\n\n`;
   t += row('Market odds', 'mkt') + row('Form model', 'form') + row('Elo model', 'elo') + row('AI', 'ai') + row('Final blend', 'final');
   t += CAL.T !== 1 ? `🔧 Self-calibration ON: T = ${CAL.T.toFixed(2)} (fitted ${CAL.fitted.toFixed(2)} on ${CAL.n} finished matches)\n` : `🔧 Self-calibration waits for ${CAL_MIN}+ finished matches (have ${CAL.n}).\n`;
 
@@ -2074,15 +2092,15 @@ async function renderStats() {
   for (const [tag, label] of [['top5', 'Top 5'], ['best10', 'Best 10'], ['best3', 'Best 3']]) {
     const r = done.filter((x) => x.tags && x.tags.includes(tag));
     if (!r.length) continue;
-    const hit = r.filter((x) => argmax(x.final) === x.res).length;
+    const hit = r.filter((x) => pickOf(x) === x.res).length;
     const ro = roiOf(r);
-    t += `\n🎯 ${label} picks: ${hit}/${r.length} correct (${pct(hit / r.length)}%)` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}% <i>(1u flat, ${ro.n} priced)</i>` : '');
+    t += `\n🎯 ${label} picks: ${hit}/${r.length} correct (${pct(hit / r.length)}%)${ciTxt(hit, r.length)}` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}% <i>(1u flat, ${ro.n} priced)</i>` : '');
   }
   const last30 = picks.filter((x) => x.utc > Date.now() - 30 * 864e5);
   if (last30.length >= 3) {
-    const hit = last30.filter((x) => argmax(x.final) === x.res).length;
+    const hit = last30.filter((x) => pickOf(x) === x.res).length;
     const ro = roiOf(last30);
-    t += `\n📅 Last 30 days: ${hit}/${last30.length} correct (${pct(hit / last30.length)}%)` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
+    t += `\n📅 Last 30 days: ${hit}/${last30.length} correct (${pct(hit / last30.length)}%)${ciTxt(hit, last30.length)}` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
   }
   const clvs = predLog.map(clvOf).filter((x) => x != null);
   if (clvs.length >= 5) {
@@ -2095,8 +2113,8 @@ async function renderStats() {
   if (lg.length) {
     t += '\n\n🌍 <b>By league</b> (published picks)\n';
     for (const [c, v] of lg) {
-      const hit = v.filter((x) => argmax(x.final) === x.res).length;
-      t += `• ${esc(LEAGUE_NAMES[c] || c)}: ${hit}/${v.length} (${pct(hit / v.length)}%)\n`;
+      const hit = v.filter((x) => pickOf(x) === x.res).length;
+      t += `• ${esc(LEAGUE_NAMES[c] || ESPN_LEAGUES[String(c).replace(/^X:/, '')] || c)}: ${hit}/${v.length} (${pct(hit / v.length)}%)\n`;
     }
   }
   const tw = tuneWeights(done);
@@ -2113,13 +2131,14 @@ function renderHistory() {
   if (!rows.length) return '📜 No published picks logged yet. Check back after the next match day.';
   let t = '📜 <b>Recent published picks</b>\n<i>✅ won · ❌ lost · ⏳ pending (1X2, 90 minutes)</i>\n\n';
   for (const r of rows) {
-    const k = argmax(r.final);
+    const k = pickOf(r);
+    const po = pubOddsOf(r, k);
     const label = k === 'H' ? `${r.home} win` : k === 'A' ? `${r.away} win` : 'Draw';
     const sign = { H: '1', D: 'X', A: '2' };
     const icon = !r.res ? '⏳' : r.res === k ? '✅' : '❌';
     const tags = (r.tags.includes('top5') ? '🏆' : '') + (r.tags.includes('best10') ? '🔟' : '') + (r.tags.includes('best3') ? '💎' : '');
     t += `${icon} ${fmtDate(r.utc)} ${tags} <b>${esc(r.home)} vs ${esc(r.away)}</b> — ${esc(label)} (${sign[k]})` +
-      (r.odds ? ` @ ${r.odds[k].toFixed(2)}` : '') + (r.res ? ` · result ${sign[r.res]}${r.score ? ' (' + r.score + ')' : ''}` : '') + '\n';
+      (po ? ` @ ${po.toFixed(2)}` : '') + (r.res ? ` · result ${sign[r.res]}${r.score ? ' (' + r.score + ')' : ''}` : '') + '\n';
   }
   return t + '\n' + DISCLAIMER;
 }
@@ -3618,9 +3637,9 @@ function proofLine(days = 30) {
   const since = Date.now() - days * 864e5;
   const rows = predLog.filter((r) => r.res && r.final && r.tags && (r.tags.includes('top5') || r.tags.includes('best3')) && r.utc > since);
   if (rows.length < 5) return '';
-  const hit = rows.filter((r) => argmax(r.final) === r.res).length;
+  const hit = rows.filter((r) => pickOf(r) === r.res).length;
   const ro = roiOf(rows);
-  return `📈 Premium picks, last ${days} days: <b>${hit}/${rows.length}</b> correct (${pct(hit / rows.length)}%)` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
+  return `📈 Premium picks, last ${days} days: <b>${hit}/${rows.length}</b> correct (${pct(hit / rows.length)}%)${ciTxt(hit, rows.length)}` + (ro.n >= 5 ? ` · ROI ${signed(ro.roi * 100)}%` : '');
 }
 
 // ----- keyboards: follow buttons, buy buttons -----
@@ -3712,7 +3731,7 @@ async function renderVip(u) {
   let tx = '👑 <b>VIP Special — most likely winners today</b>\n<i>The matches where one side has the highest win probability across bookmaker odds, the goals model and AI.</i>\n';
   if (!strong.length) tx += `<i>No match reaches ${pct(VIP_MIN_P)}% today — these are the strongest available.</i>\n`;
   tx += '\n' + FOLLOW_HINT;
-  list.forEach((x) => logPrediction(x.m, x.st, 'vip'));
+  if (!tagFrozen('vip')) list.forEach((x) => logPrediction(x.m, x.st, 'vip'));
   list.forEach(({ m, st, sc }, i) => {
     const p = sc.pick, k = p.k;
     tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
@@ -4084,7 +4103,7 @@ async function settleTick() {
   for (const w of rows) {
     const r = predById.get(w.match_id);
     if (r && r.res) {
-      const k = r.final ? argmax(r.final) : null;
+      const k = r.final ? pickOf(r) : null;
       const txt = `🏁 <b>${esc(w.home)} vs ${esc(w.away)}</b> finished${r.score ? ' ' + r.score : ''} — result <b>${sign1x2[r.res]}</b>.` +
         (k ? `\nOur lean (${sign1x2[k]}): ${k === r.res ? '✅ correct' : '❌ missed'}` : '');
       await q('UPDATE watch SET res_sent = true WHERE user_id = $1 AND match_id = $2', [w.user_id, w.match_id]);
@@ -4101,7 +4120,7 @@ async function settleTick() {
   savePredLog();
   let won = 0, tx = '📊 <b>Results of our recent picks</b>\n\n';
   for (const r of fresh.sort((a, b) => a.utc - b.utc)) {
-    const k = argmax(r.final);
+    const k = pickOf(r);
     if (k === r.res) won++;
     tx += `${k === r.res ? '✅' : '❌'} ${esc(r.home)} vs ${esc(r.away)} — pick ${sign1x2[k]}, result ${sign1x2[r.res]}${r.score ? ' (' + r.score + ')' : ''}\n`;
   }
@@ -4887,6 +4906,15 @@ const ADMIN_HELP =
   '🛡 <b>Admin</b>\n/users – user &amp; revenue stats\n/payments – last payments\n/credits – Odds API credits\n/grant &lt;id&gt; &lt;days&gt; · /revoke &lt;id&gt;\n/ban &lt;id&gt; · /unban &lt;id&gt;\n' +
   '/broadcast &lt;text&gt; – everyone · /broadcastp &lt;text&gt; – premium only\n/pick – choose contacts from your Telegram list &amp; send them picks or a message\n/free – choose which Premium features are free\n/forceupdate – clear caches\n/resolve – settle pending results now\n/feedstatus – score-feed health\n/userinfo &lt;id&gt;\n/dashboard – revenue, conversion &amp; churn\n/promo – create / list / delete promo codes\n/unexclude &lt;id&gt; – lift a self-exclusion\n/autotune [on|off|now|reset] – weight auto-tuning\n/channel [test|results] – public channel posts';
 bot.command('admin', adminOnly((ctx) => showAdmin(ctx)));
+bot.command('dupes', adminOnly(async (ctx) => { // same match logged twice under different names/competitions
+  const rows = predLog.filter((r) => r.utc > Date.now() - 30 * 864e5), out = [];
+  for (let i = 0; i < rows.length; i++) for (let j = i + 1; j < rows.length; j++) {
+    const a = rows[i], b = rows[j];
+    if (Math.abs(a.utc - b.utc) < 3 * 3600e3 && nameScore(a.home, b.home) >= 0.5 && nameScore(a.away, b.away) >= 0.5)
+      out.push(`${esc(a.home)} v ${esc(a.away)} [${esc(a.comp)}] ≈ ${esc(b.home)} v ${esc(b.away)} [${esc(b.comp)}]`);
+  }
+  await reply(ctx, out.length ? `⚠️ ${out.length} possible duplicates:\n` + out.slice(0, 20).join('\n') : '✅ No duplicates found.');
+}));
 bot.command('resolve', adminOnly(detach(async (ctx) => {
   const now = Date.now();
   const openNow = () => predLog.filter((r) => !r.res && r.utc < now - 3 * 3600e3 && r.utc > now - 5 * 864e5);
