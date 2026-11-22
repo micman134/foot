@@ -2298,13 +2298,17 @@ async function initDb() {
 // ---------- Small utils ----------
 const money = (n) => Number(n).toLocaleString('en-NG', { maximumFractionDigits: 0 });
 const peek = (key) => { const c = cache.get(key); return c && c.exp > Date.now() ? c.val : null; };
-function refineAll() { // AI opinion for EVERY upcoming match of the day; cached and shared by Top 5 / Best 3 / Value / Acca / Goals / DC
+const AI_REFINE_MAX = Number(process.env.AI_REFINE_MAX || 30); // max matches that get an AI opinion per day
+const AI_WAIT_MS = Number(process.env.AI_WAIT_SEC || 20) * 1000;  // commands wait at most this long for the AI, then answer with odds + form (AI keeps working in the background)
+function refineAll() { // AI opinion for the upcoming matches of the day; cached and shared by Top 5 / Best 3 / Value / Acca / Goals / DC
   return cached('refineall:' + localDate(new Date()), CACHE_MS, async () => {
     if (!AI_ON) return true;
-    const ms = (await getMatchesToday()).filter((m) => m.utc > Date.now());
+    const ms = (await getMatchesToday()).filter((m) => m.utc > Date.now()).slice(0, AI_REFINE_MAX);
     let ok = 0;
-    await pool(ms, AI_CONCURRENCY, async (m) => { try { const r = await aiRefine(m, await deepAnalysis(m)); if (r && r.ai) ok++; } catch (e) {} });
-    if (ms.length && !ok) throw new Error('AI unavailable'); // not cached -> retried on the next request
+    const work = pool(ms, AI_CONCURRENCY, async (m) => { try { const r = await aiRefine(m, await deepAnalysis(m)); if (r && r.ai) ok++; } catch (e) {} });
+    work.catch(() => {});
+    const finished = await Promise.race([work.then(() => true), new Promise((r) => setTimeout(() => r(false), AI_WAIT_MS))]);
+    if (finished && ms.length && !ok) throw new Error('AI unavailable'); // not cached -> retried on the next request
     return true;
   });
 }
