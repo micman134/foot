@@ -50,7 +50,16 @@ const { Telegraf, Markup } = require('telegraf');
 // ---------- Config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const FD_KEY = process.env.FOOTBALL_DATA_KEY || '';
-const ODDS_KEY = process.env.ODDS_API_KEY || '';
+// The Odds API keys: use 1-4 keys. When one runs out of credits the bot switches to the next one automatically.
+//   ODDS_API_KEY, ODDS_API_KEY_2, ODDS_API_KEY_3, ODDS_API_KEY_4   (or)   ODDS_API_KEYS=key1,key2,key3
+const ODDS_KEYS = [...new Set([
+  process.env.ODDS_API_KEY, process.env.ODDS_API_KEY_2, process.env.ODDS_API_KEY_3, process.env.ODDS_API_KEY_4,
+  ...String(process.env.ODDS_API_KEYS || '').split(','),
+].map((k) => String(k || '').trim()).filter(Boolean))];
+const ODDS_KEY = ODDS_KEYS[0] || ''; // kept so every existing "is the odds feed configured?" check still works
+const oddsPool = ODDS_KEYS.map((key, i) => ({ key, n: i + 1, remaining: null, used: null, at: 0, outUntil: 0, alertedDay: '' }));
+const ODDS_KEY_RETRY_MS = Number(process.env.ODDS_KEY_RETRY_HOURS || 3) * 3600e3; // re-test an empty key after this long (monthly reset)
+const oddsPick = () => oddsPool.find((k) => k.outUntil <= Date.now()) || null; // first key that still has credits
 // AI provider (OpenAI-compatible chat API) - ONLINE hosted models.
 // AI_PROVIDER = groq | openrouter | gemini | hf | pollinations | custom | off   (ollama = local, optional)
 //   groq         : GROQ_API_KEY        - fast, generous free tier (https://console.groq.com)
@@ -325,27 +334,50 @@ const SHARP_BOOKS = { pinnacle: 4, betfair_ex_eu: 3, betfair_ex_uk: 3, matchbook
 const ODDS_GAP_MS = Number(process.env.ODDS_GAP_MS || 400); // minimum gap between Odds API calls
 let oddsNextAt = 0;
 let oddsCooldownUntil = 0;
+// URLs carry the placeholder {KEY}; it is replaced with the key currently in use.
 async function oddsGet(url, timeoutMs = 20000, tries = 2) {
-  let res;
-  for (let i = 0; i < tries; i++) {
+  let res, attempt = 0, rotations = 0;
+  while (attempt < tries) {
+    const k = oddsPick();
+    if (!k) return new Response('all Odds API keys are out of credits', { status: 402 });
     const start = Math.max(Date.now(), oddsCooldownUntil, oddsNextAt); // reserve a slot (safe: JS is single-threaded)
     oddsNextAt = start + ODDS_GAP_MS;
     if (start > Date.now()) await sleep(start - Date.now());
-    res = await fetchRetry(url, { headers: FEED_HEADERS }, timeoutMs, 1);
+    res = await fetchRetry(url.replace('{KEY}', encodeURIComponent(k.key)), { headers: FEED_HEADERS }, timeoutMs, 1);
+    res.oddsKey = k;
+    if (res.status === 401 || res.status === 402) { // out of credits (OUT_OF_USAGE_CREDITS) or invalid key -> switch to the next key
+      let body = '';
+      try { body = await res.clone().text(); } catch (e) {}
+      oddsKeyOut(k, /OUT_OF_USAGE_CREDITS/i.test(body) || res.status === 402 ? 'out of credits' : 'rejected (invalid key?)', /OUT_OF_USAGE_CREDITS/i.test(body) ? ODDS_KEY_RETRY_MS : 24 * 3600e3);
+      if (++rotations <= oddsPool.length && oddsPick()) continue; // retry the same request with the next key (not counted as an attempt)
+      return res;
+    }
     if (res.status !== 429) return res;
+    attempt++;
     const ra = Number(res.headers.get('retry-after'));
-    const cool = Math.min(Math.max(ra > 0 ? ra * 1000 : 20000 * (i + 1), 5000), 90000);
+    const cool = Math.min(Math.max(ra > 0 ? ra * 1000 : 20000 * attempt, 5000), 90000);
     oddsCooldownUntil = Date.now() + cool;
     console.log(`Odds API rate-limited (429) - pausing ${Math.round(cool / 1000)}s`);
   }
   return res;
+}
+// mark a key as empty and tell the admins which key took over
+function oddsKeyOut(k, why, retryMs) {
+  if (k.outUntil > Date.now()) return;
+  k.outUntil = Date.now() + retryMs; k.remaining = 0;
+  const next = oddsPick();
+  console.log(`Odds API key #${k.n} ${why}` + (next ? ` - switching to key #${next.n}` : ' - no keys left'));
+  if (typeof notifyAdmins === 'function') {
+    notifyAdmins(`⚠️ Odds API key #${k.n} ${why}. ` + (next ? `Now using key #${next.n} of ${oddsPool.length}.` : `<b>No keys left</b> - using saved odds until a key is topped up (retry in ${Math.round(retryMs / 3600e3)}h).`)).catch(() => {});
+  }
+  refreshOddsCredits();
 }
 
 async function fetchOddsLive(sportKey) {
   if (!ODDS_KEY) return [];
   const url =
     `https://api.the-odds-api.com/v4/sports/${sportKey}/odds` +
-    `?regions=${encodeURIComponent(ODDS_REGIONS)}&markets=h2h&oddsFormat=decimal&apiKey=${ODDS_KEY}`;
+    `?regions=${encodeURIComponent(ODDS_REGIONS)}&markets=h2h&oddsFormat=decimal&apiKey={KEY}`;
   const res = await oddsGet(url, 25000, 2);
   noteCredits(res);
   if (!res.ok) throw new Error('Odds API ' + res.status);
@@ -719,7 +751,7 @@ async function oddsApiEventsDay(today) {
   if (Date.now() < oddsCooldownUntil) { extraDiag.oxErr = 'cooling down after 429'; return oxCache.day === today ? copy(oxCache.list) : []; }
   try {
     const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
-    const res = await oddsGet(`https://api.the-odds-api.com/v4/sports/?apiKey=${ODDS_KEY}`, 20000, 2);
+    const res = await oddsGet(`https://api.the-odds-api.com/v4/sports/?apiKey={KEY}`, 20000, 2);
     if (!res.ok) { extraDiag.oxErr = 'sports HTTP ' + res.status; return []; }
     const sports = (await res.json()).filter((x) => String(x.key).startsWith('soccer_') && x.active && !x.has_outrights);
     const win = `&commenceTimeFrom=${iso(Date.now())}&commenceTimeTo=${iso(Date.now() + 30 * 3600e3)}`; // only the next ~30h
@@ -727,7 +759,7 @@ async function oddsApiEventsDay(today) {
     const lists = await pool(sports, 2, async (sp) => {
       if (limited) return []; // first 429 stops the rest of the batch
       try {
-        const r = await oddsGet(`https://api.the-odds-api.com/v4/sports/${sp.key}/events?apiKey=${ODDS_KEY}&dateFormat=iso${win}`, 15000, 1);
+        const r = await oddsGet(`https://api.the-odds-api.com/v4/sports/${sp.key}/events?apiKey={KEY}&dateFormat=iso${win}`, 15000, 1);
         if (r.status === 429) { limited = true; return []; }
         if (!r.ok) return [];
         return (await r.json()).map((ev) => ({ ev, sp }));
@@ -2681,17 +2713,28 @@ async function recheckPendingPaystack() {
 }
 
 // ---------- Odds API credit tracking (admin /credits) ----------
-const oddsCredits = { remaining: null, used: null, at: 0, alertedDay: '' };
+const oddsCredits = { remaining: null, used: null, at: 0, alertedDay: '' }; // totals across all keys (remaining = null while a usable key has not been called yet)
+function refreshOddsCredits() {
+  const live = oddsPool.filter((k) => k.outUntil <= Date.now());
+  const unknown = live.some((k) => k.remaining == null);
+  oddsCredits.remaining = unknown ? null : live.reduce((a, k) => a + (k.remaining || 0), 0);
+  const used = oddsPool.filter((k) => k.used != null);
+  oddsCredits.used = used.length ? used.reduce((a, k) => a + k.used, 0) : null;
+}
 function noteCredits(res) {
+  const k = res && res.oddsKey;
+  if (!k) return;
   const rem = Number(res.headers.get('x-requests-remaining'));
   const used = Number(res.headers.get('x-requests-used'));
-  if (Number.isFinite(rem)) {
-    oddsCredits.remaining = rem; oddsCredits.used = Number.isFinite(used) ? used : null; oddsCredits.at = Date.now();
-    const day = localDate(new Date());
-    if (rem <= ODDS_LOW_CREDITS && oddsCredits.alertedDay !== day) {
-      oddsCredits.alertedDay = day;
-      notifyAdmins(`⚠️ The Odds API credits are low: <b>${rem}</b> left this month.`).catch(() => {});
-    }
+  if (!Number.isFinite(rem)) return;
+  k.remaining = rem; k.used = Number.isFinite(used) ? used : null; k.at = Date.now();
+  oddsCredits.at = Date.now();
+  if (rem <= 0) { oddsKeyOut(k, 'ran out of credits', ODDS_KEY_RETRY_MS); return; }
+  refreshOddsCredits();
+  const day = localDate(new Date());
+  if (rem <= ODDS_LOW_CREDITS && k.alertedDay !== day) {
+    k.alertedDay = day;
+    notifyAdmins(`⚠️ Odds API key #${k.n} credits are low: <b>${rem}</b> left this month.` + (oddsPool.length > 1 ? ' The next key will take over automatically.' : '')).catch(() => {});
   }
 }
 
@@ -4223,7 +4266,7 @@ async function ensureGoalOdds(m) {
   if (oddsCredits.remaining != null && oddsCredits.remaining <= ODDS_LOW_CREDITS * 2) return null;
   gxDay.n++;
   try {
-    const url = `https://api.the-odds-api.com/v4/sports/${m.odds.sport}/events/${m.odds.id}/odds?regions=${encodeURIComponent(ODDS_REGIONS)}&markets=totals,btts&oddsFormat=decimal&apiKey=${ODDS_KEY}`;
+    const url = `https://api.the-odds-api.com/v4/sports/${m.odds.sport}/events/${m.odds.id}/odds?regions=${encodeURIComponent(ODDS_REGIONS)}&markets=totals,btts&oddsFormat=decimal&apiKey={KEY}`;
     const res = await oddsGet(url, 20000, 2);
     noteCredits(res);
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -5217,9 +5260,17 @@ bot.command('fixtures', adminOnly(async (ctx) => {
   const ex = all.filter((m) => m.extra).length;
   return reply(ctx, `🔧 <b>Fixture sources</b> (${localDate(new Date())})\nfootball-data: <b>${all.length - ex}</b>\nESPN: <b>${extraDiag.espnCount}</b> (${extraDiag.espnOk}/${extraDiag.espnLeagues} leagues answered, ${extraDiag.espnMissing} unknown slugs${extraDiag.firstErr ? ' · first error: ' + esc(extraDiag.firstErr) : ''})\nTheSportsDB: <b>${extraDiag.sdbCount}</b>${extraDiag.sdbErr ? ' · error: ' + esc(extraDiag.sdbErr) : ''}\nOdds API events: <b>${extraDiag.oxCount}</b>${extraDiag.oxErr ? ' · error: ' + esc(extraDiag.oxErr) : ''}\nShown in /today: <b>${all.length}</b> (${extraDiag.withOdds} extras with odds)`);
 }));
-bot.command('credits', adminOnly((ctx) => reply(ctx, oddsCredits.remaining == null
-  ? '🎟 No Odds API call has been made since the bot started.'
-  : `🎟 The Odds API: <b>${oddsCredits.remaining}</b> credits left${oddsCredits.used != null ? ` (${oddsCredits.used} used)` : ''} — as of ${fmtTime(oddsCredits.at)}.`)));
+bot.command('credits', adminOnly((ctx) => {
+  if (!oddsPool.length) return reply(ctx, '🎟 No Odds API key is set (ODDS_API_KEY).');
+  if (!oddsPool.some((k) => k.remaining != null)) return reply(ctx, `🎟 No Odds API call has been made since the bot started (${oddsPool.length} key${oddsPool.length > 1 ? 's' : ''} loaded).`);
+  const active = oddsPick();
+  const lines = oddsPool.map((k) => {
+    const st = k.outUntil > Date.now() ? '⛔ empty' : active && active.n === k.n ? '✅ in use' : '⏳ standby';
+    return `Key #${k.n}: <b>${k.remaining == null ? 'not used yet' : k.remaining}</b> left${k.used != null ? ` (${k.used} used)` : ''} · ${st}`;
+  });
+  const tot = oddsCredits.remaining != null ? `\nTotal: <b>${oddsCredits.remaining}</b> credits left` : '';
+  return reply(ctx, `🎟 <b>The Odds API</b> — as of ${fmtTime(oddsCredits.at)}\n${lines.join('\n')}${tot}`);
+}));
 bot.command('grant', adminOnly(async (ctx) => {
   const [id, days] = argText(ctx).split(/\s+/).map(Number);
   if (!id || !days) return reply(ctx, 'Usage: /grant &lt;userId&gt; &lt;days&gt;');
