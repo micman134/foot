@@ -1547,7 +1547,7 @@ function reasonOf(m, st) {
   return '';
 }
 
-// Ranked list shared by Top 5 (premium) and Best 10 (free): 5 premium picks + the next 10.
+// Ranked lists: Top 5 / Best 10 Pro / VIP (premium, no popular clubs or countries) and Best 10 (free, the only list that may include them).
 async function computeRanked() {
   const key = 'top5:' + localDate(new Date());
   const c = cache.get(key);
@@ -1557,7 +1557,7 @@ async function computeRanked() {
   cache.set(key, { pending, exp: 0 });
   try {
     const val = await pending;
-    const aiOk = !AI_ON || val.some((x) => x.st.ai);
+    const aiOk = !AI_ON || val.all.some((x) => x.st.ai);
     cache.set(key, { val, exp: Date.now() + (aiOk ? CACHE_MS : 10 * 60e3) });
     return val;
   } catch (e) {
@@ -1573,16 +1573,30 @@ async function computeTop5Raw() {
   for (const m of matches) withStats.push({ m, st: await deepAnalysis(m) });
   const rank = (arr) =>
     arr.map((x) => ({ ...x, sc: pickScore(x.m, x.st) })).filter((x) => x.sc).sort((a, b) => b.sc.score - a.sc.score);
-  const cands = rank(withStats).slice(0, MAX_AI_MATCHES);
+  // Premium lists skip popular clubs / countries. The free Best 10 may use them, so a few popular matches still get an AI opinion.
+  const ranked0 = rank(withStats);
+  const cands = [
+    ...ranked0.filter((x) => !isPopularMatch(x.m)).slice(0, MAX_AI_MATCHES),
+    ...ranked0.filter((x) => isPopularMatch(x.m)).slice(0, 10),
+  ];
   const refined = await pool(cands, AI_CONCURRENCY, async (x) => ({ m: x.m, st: await aiRefine(x.m, x.st).catch(() => x.st) }));
   withStats.forEach((x) => logPrediction(x.m, x.st));
   refined.forEach((x) => logPrediction(x.m, x.st));
-  const top = rank(refined).slice(0, 15);
-  if (!tagFrozen('top5')) top.forEach((x, i) => { logPrediction(x.m, x.st, i < 5 ? 'top5' : 'best10'); if (i < 10) logPrediction(x.m, x.st, 'pro10'); }); // tags frozen once per day
-  return top;
+  const all = rank(refined).slice(0, 40);
+  const clean = all.filter((x) => !isPopularMatch(x.m));                    // no big clubs, no national teams
+  const top5 = clean.slice(0, 5);
+  const used = new Set(top5.map((x) => x.m.id));
+  const best10 = (BEST10_INCLUDES_TOP5 ? all : all.filter((x) => !used.has(x.m.id))).slice(0, 10); // free: popular clubs allowed here
+  const pro10 = clean.slice(0, 10);
+  if (!tagFrozen('top5')) { // tags frozen once per day
+    top5.forEach((x) => logPrediction(x.m, x.st, 'top5'));
+    best10.forEach((x) => logPrediction(x.m, x.st, 'best10'));
+    pro10.forEach((x) => logPrediction(x.m, x.st, 'pro10'));
+  }
+  return { all, clean, top5, best10, pro10 };
 }
-const computeTop5 = async () => (await computeRanked()).slice(0, 5);
-const computeBest10 = async () => (await computeRanked()).slice(BEST10_INCLUDES_TOP5 ? 0 : 5, BEST10_INCLUDES_TOP5 ? 10 : 15);
+const computeTop5 = async () => (await computeRanked()).top5;
+const computeBest10 = async () => (await computeRanked()).best10;
 
 // ---------- Best 3 : under-the-radar picks (never top-table or "popular" clubs) ----------
 // Uses the season data already downloaded for the other features, so it costs NO extra football-data requests.
@@ -1595,6 +1609,33 @@ function isBigClub(...names) {
   // a name only counts if it carries at least as many words as the big-club entry (stops "Paris FC" matching "Paris Saint Germain")
   return names.filter(Boolean).some((n) => BIG_CLUBS.some((b) => nameScore(n, b) >= 1 && (toks(b).length === 1 || toks(n).length >= toks(b).length)));
 }
+
+// ---------- Popular = big clubs + national teams (countries) ----------
+// These never appear in Top 5, Best 3, Best 10 Pro, VIP or Smart 10/5/3. They are only allowed in the free Best 10.
+const COUNTRIES = [
+  'England', 'Scotland', 'Wales', 'Northern Ireland', 'Ireland', 'Republic of Ireland', 'France', 'Germany', 'Spain', 'Italy', 'Portugal',
+  'Netherlands', 'Holland', 'Belgium', 'Croatia', 'Serbia', 'Switzerland', 'Austria', 'Denmark', 'Sweden', 'Norway', 'Finland', 'Iceland',
+  'Poland', 'Czech Republic', 'Czechia', 'Slovakia', 'Slovenia', 'Hungary', 'Romania', 'Bulgaria', 'Greece', 'Turkey', 'Turkiye', 'Ukraine',
+  'Russia', 'Albania', 'Bosnia and Herzegovina', 'Bosnia', 'North Macedonia', 'Montenegro', 'Kosovo', 'Georgia', 'Armenia', 'Azerbaijan',
+  'Kazakhstan', 'Israel', 'Cyprus', 'Luxembourg', 'Malta', 'Estonia', 'Latvia', 'Lithuania', 'Belarus', 'Moldova', 'Faroe Islands',
+  'Brazil', 'Argentina', 'Uruguay', 'Colombia', 'Chile', 'Peru', 'Ecuador', 'Paraguay', 'Bolivia', 'Venezuela',
+  'USA', 'United States', 'Mexico', 'Canada', 'Costa Rica', 'Panama', 'Jamaica', 'Honduras', 'El Salvador', 'Haiti', 'Trinidad and Tobago',
+  'Nigeria', 'Ghana', 'Senegal', 'Morocco', 'Algeria', 'Tunisia', 'Egypt', 'Cameroon', 'Ivory Coast', 'Cote dIvoire', 'Cote d Ivoire', 'Mali', 'Burkina Faso',
+  'South Africa', 'DR Congo', 'Congo', 'Cape Verde', 'Guinea', 'Gabon', 'Zambia', 'Zimbabwe', 'Angola', 'Benin', 'Uganda', 'Kenya', 'Tanzania',
+  'Japan', 'South Korea', 'Korea Republic', 'North Korea', 'China', 'China PR', 'Australia', 'New Zealand', 'Iran', 'IR Iran', 'Iraq',
+  'Saudi Arabia', 'Qatar', 'United Arab Emirates', 'UAE', 'Jordan', 'Uzbekistan', 'Oman', 'Bahrain', 'Syria', 'Lebanon', 'India', 'Thailand', 'Vietnam',
+].concat((process.env.EXTRA_COUNTRIES || '').split(',').map((x) => x.trim()).filter(Boolean));
+const COUNTRY_KEYS = new Set(COUNTRIES.map((c) => toks(c).join(' ')));
+const NATIONAL_COMPS = new Set(['WC', 'EC']);
+function isCountryName(...names) {
+  return names.filter(Boolean).some((n) => {
+    // "Brazil U21", "Spain Women", "France national team" still count as the country
+    const t = toks(n).filter((x) => !/^u\d{2}$/.test(x) && !['women', 'w', 'national', 'team'].includes(x));
+    return t.length > 0 && COUNTRY_KEYS.has(t.join(' '));
+  });
+}
+const isPopularName = (...names) => isBigClub(...names) || isCountryName(...names);
+const isPopularMatch = (m) => NATIONAL_COMPS.has(m.comp) || isPopularName(m.home, m.homeFull) || isPopularName(m.away, m.awayFull);
 
 function buildTable(season) {
   const t = new Map();
@@ -1700,6 +1741,7 @@ function deepAnalysis(m) {
 
 function whyPopular(short, full, prof, tableOk) {
   if (isBigClub(short, full)) return 'big club';
+  if (isCountryName(short, full)) return 'national team';
   if (tableOk && prof.rank && prof.rank <= TOP_RANK_EXCLUDE) return `top ${TOP_RANK_EXCLUDE} (#${prof.rank})`;
   return null;
 }
@@ -1858,7 +1900,7 @@ async function dayCached(key, raw, okFn) {
 // Smart 10 / Smart 5: the 10 best picks of the day across all matches (Smart 5 = the first 5 of them)
 async function computeSmartRaw() {
   const now = Date.now();
-  const matches = (await getMatchesToday()).filter((m) => m.odds && m.utc > now);
+  const matches = (await getMatchesToday()).filter((m) => m.odds && m.utc > now && !isPopularMatch(m)); // no popular clubs / countries
   const withStats = [];
   for (const m of matches) withStats.push({ m, st: await deepAnalysis(m) });
   const rank = (arr) => arr.map((x) => ({ ...x, sc: comboScore(x.m, x.st) })).filter((x) => x.sc).sort((a, b) => b.sc.score - a.sc.score);
@@ -3763,7 +3805,7 @@ async function renderTeaser(u, kind) {
 
 // ----- Best 10 Pro (Premium): the 10 top-ranked picks with confidence tiers + model breakdown -----
 async function renderBest10Pro(u) {
-  const all = (await computeRanked()).filter(isUpcoming);
+  const all = (await computeRanked()).clean.filter(isUpcoming);
   const list = applyPrefs(all, u).slice(0, 10);
   if (!list.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null };
   let tx = '🔟⭐ <b>Best 10 Pro</b>\n<i>The 10 highest-ranked picks today, with confidence tiers and the model breakdown.</i>\n' + LEGEND + '\n' + FOLLOW_HINT;
@@ -3786,7 +3828,7 @@ async function renderBest10Pro(u) {
 const VIP_MIN_P = Number(process.env.VIP_MIN_P || 0.6);
 const VIP_COUNT = Number(process.env.VIP_COUNT || 3);
 async function renderVip(u) {
-  const all = (await computeRanked()).filter(isUpcoming);
+  const all = (await computeRanked()).clean.filter(isUpcoming);
   const wins = applyPrefs(all, u).filter((x) => x.sc.pick.k !== 'D').sort((a, b) => b.sc.pick.p - a.sc.pick.p || b.sc.agreeN - a.sc.agreeN);
   if (!wins.length) return { text: all.length ? t(u, 'none_prefs') : t(u, 'none_qual'), kb: null };
   const strong = wins.filter((x) => x.sc.pick.p >= VIP_MIN_P);
