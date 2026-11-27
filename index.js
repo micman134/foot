@@ -2246,6 +2246,7 @@ const SECTIONS = [
   ['top5', '🏆 Top 5', false], ['best10', '🔟 Best 10', false], ['pro10', '🔟⭐ Best 10 Pro', false], ['best3', '💎 Best 3', false],
   ['best1', '🥇 Best 1', false], ['vip', '👑 VIP Special', false],
   ['smart10', '🎯 Smart 10', true], ['smart5', '🎯 Smart 5', true], ['smart3', '🎯 Smart 3', true], ['week', '📅 7-Day picks', true],
+  ['bestodds', '📈 Best-odds picks', false],
 ];
 const SECTION_LABEL = Object.fromEntries(SECTIONS.map(([k, l]) => [k, l]));
 function sectionRows(tag, days = 0) {
@@ -2444,7 +2445,7 @@ const validTz = (tz) => { try { new Intl.DateTimeFormat('en', { timeZone: tz });
 // ---------- Languages: English · Pidgin · Français ----------
 const CMD_LIST =
   '<b>📋 All commands</b>\n' +
-  '\n🔥 <b>Picks</b>\n/picks · /best10 · /top5 · /best3 · /best1 · /best10pro · /potw · /vip · /week\n/smart10 · /smart5 · /smart3\n/week [days] [per day] [min %] [dc|win|goals]\n' +
+  '\n🔥 <b>Picks</b>\n/picks · /best10 · /top5 · /best3 · /best1 · /best10pro · /potw · /vip · /week\n/bestodds · /deep [team] · /oddscheck\n/smart10 · /smart5 · /smart3\n/week [days] [per day] [min %] [dc|win|goals]\n' +
   '\n⚽ <b>Matches</b>\n/today · /live · /table · /predict · /matches\n' +
   '\n📈 <b>Markets</b> <i>(Premium)</i>\n/markets · /value · /goals · /dc · /scores\n/result · /htft · /combos · /handicaps · /market\n' +
   '\n🎯 <b>Accumulators</b> <i>(Premium)</i>\n/accas · /acca · /safe · /weekend\n' +
@@ -2551,7 +2552,7 @@ const hasPremium = (u) => isAdminId(u.id) || (u.plan_until && new Date(u.plan_un
 const FEATURES = {
   top5: '🏆 Top 5', best3: '💎 Best 3', best1: '🥇 Best 1', best10pro: '🔟⭐ Best 10 Pro', potw: '🌟 Pick of the Week',
   weekend: '🏖 Weekend special', vip: '👑 VIP Special', week: '📅 7-Day picks', smart5: '🎯 Smart 5', smart3: '🎯 Smart 3', value: '📈 Value bets',
-  goals: '⚽ Goals markets', dc: '🛡 Double chance', safe: '🛡 Safe slip', scores: '🎯 Correct score', acca: '🎯 Accumulators',
+  bestodds: '📈 Best-odds picks', deep: '🔬 Deep analysis', goals: '⚽ Goals markets', dc: '🛡 Double chance', safe: '🛡 Safe slip', scores: '🎯 Correct score', acca: '🎯 Accumulators',
   markets: '📋 All markets', watchlist: '⭐ Watchlist', daily: '🔔 Daily picks push', analysis: '🔍 Unlimited analyses',
 };
 const FREE_FEATURES = new Set();
@@ -2566,11 +2567,12 @@ async function loadFree() {
 const saveFree = () => q(`INSERT INTO settings (key, value) VALUES ('free_features', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify([...FREE_FEATURES])]);
 const CMD_FEATURE = {
   top5: 'top5', best3: 'best3', best1: 'best1', best10pro: 'best10pro', potw: 'potw', weekend: 'weekend', week: 'week', weekly: 'week', safe: 'safe', scores: 'scores', vip: 'vip',
-  smart5: 'smart5', smart3: 'smart3', value: 'value', goals: 'goals', dc: 'dc', acca: 'acca', watchlist: 'watchlist', subscribe: 'daily',
+  smart5: 'smart5', smart3: 'smart3', bestodds: 'bestodds', deep: 'deep', value: 'value', goals: 'goals', dc: 'dc', acca: 'acca', watchlist: 'watchlist', subscribe: 'daily',
   result: 'markets', htft: 'markets', combos: 'markets', handicaps: 'markets', market: 'markets', predict: 'analysis',
 };
 const CB_FEATURE = [
-  [/^(top5|best3|best1|best10pro|potw|weekend|week|safe|scores|vip|smart5|smart3|value|goals|dc)$/, (m) => m[1]],
+  [/^(top5|best3|best1|best10pro|potw|weekend|week|safe|scores|vip|smart5|smart3|bestodds|deep|value|goals|dc)$/, (m) => m[1]],
+  [/^dp:\d+$/, 'deep'],
   [/^acca(:|$)/, 'acca'], [/^wk(set)?:/, 'week'], [/^(mk:|am:|mkhelp)/, 'markets'], [/^w:/, 'watchlist'], [/^set:sub$/, 'daily'], [/^m:\d+:\d+$/, 'analysis'],
 ];
 const MENU_FEATURE = { '🏆 Top 5': 'top5', '💎 Best 3': 'best3', '📈 Value': 'value', '🎯 Acca': 'acca', '⭐ Watchlist': 'watchlist' };
@@ -2947,6 +2949,7 @@ async function renderDetailFor(m, backData, u) {
   tx += '\n' + t(u, 'disc');
   const rows = [[Markup.button.callback('⭐ Watch', `w:${m.id}`), Markup.button.callback('🔁 H2H history', `h2h:${m.id}`)]];
   rows.push([Markup.button.callback((hasPremium(u) || isFree('markets') ? '' : '🔒 ') + '📋 All markets (GG, O/U, HT/FT, handicaps…)', `am:${m.id}`)]);
+  rows.push([Markup.button.callback((hasPremium(u) || isFree('deep') ? '' : '🔒 ') + '🔬 Deep analysis (lineups, pitch, weather)', `dp:${m.id}`)]);
   if (backData) rows.push([Markup.button.callback('⬅️ Back to list', backData)]);
   rows.push([Markup.button.callback('🔟 Best 10', 'best10'), Markup.button.callback('🏆 Top 5', 'top5'), Markup.button.callback('💎 Best 3', 'best3'), MENU_BTN]);
   return { text: tx, kb: Markup.inlineKeyboard(rows) };
@@ -4015,6 +4018,8 @@ function hubView(name, u) {
         [LBTN(u, '💎 Best 3', 'best3'), LBTN(u, '🥇 Best 1', 'best1')],
         [LBTN(u, '🔟⭐ Best 10 Pro', 'best10pro'), LBTN(u, '🌟 Pick of the Week', 'potw')],
         [LBTN(u, '📅 7-Day Picks', 'week'), LBTN(u, '👑 VIP Special', 'vip')],
+        [LBTN(u, '📈 Best-odds picks', 'bestodds'), LBTN(u, '🔬 Deep analysis', 'deep')],
+        [LBTN(u, '📊 Odds check', 'oddscheck', false)],
         [LBTN(u, '🎯 Smart 10 · Free', 'smart10', false), LBTN(u, '🎯 Smart 5', 'smart5'), LBTN(u, '🎯 Smart 3', 'smart3')],
         [B('📊 Section stats', 'sec')],
         back,
@@ -5520,6 +5525,455 @@ bot.action(/^hub:(picks|matches|markets|acca|me|more)$/, async (ctx) => {
   await editOrReply(ctx, v.text, v.kb);
 });
 
+// =====================================================================
+//  FEATURE PACK 4 — odds-band check (/oddscheck) · best-odds picks (/bestodds) · deep analysis (/deep: lineups, pitch, weather)
+// =====================================================================
+// ENV (all optional)
+//   ODDS_BAND_MIN=12        settled picks a price range needs before /bestodds fully trusts it
+//   ODDS_BAND_SOFT_MIN=6    below ODDS_BAND_MIN but above this, a range is used with an "early data" warning
+//   ODDS_BAND_PRIOR_N=20    shrinkage: every range starts with this many imaginary bets at ODDS_BAND_PRIOR_ROI (-5% = the bookmaker margin)
+//   BESTODDS_COUNT=5        matches shown by /bestodds        BESTODDS_BANDS=2   how many top price ranges are used
+//   BESTODDS_MIN_P=0.40     minimum model probability for a /bestodds pick
+//   DEEP_MAX=6              matches analysed by /deep with no team name   DEEP_LOOKBACK=3  past games used to learn a team's regular XI
+//   DEEP_WEIGHT=0.5         how much of the lineup/weather/pitch shift is applied to the final probabilities (bookmaker odds already price much of it)
+//   DEEP_MAX_SHIFT=0.06     hard cap on how far one outcome may move      DEEP_LINEUPS=off / DEEP_WEATHER=off  switch a data source off
+const BAND_EDGES = [1, 1.3, 1.5, 1.7, 2, 2.5, 3.5, 1e9];
+const BAND_MIN = Number(process.env.ODDS_BAND_MIN || 12);
+const BAND_SOFT_MIN = Number(process.env.ODDS_BAND_SOFT_MIN || 6);
+const BAND_PRIOR_N = Number(process.env.ODDS_BAND_PRIOR_N || 20);
+const BAND_PRIOR_ROI = Number(process.env.ODDS_BAND_PRIOR_ROI || -0.05);
+const BESTODDS_COUNT = Number(process.env.BESTODDS_COUNT || 5);
+const BESTODDS_BANDS = Number(process.env.BESTODDS_BANDS || 2);
+const BESTODDS_MIN_P = Number(process.env.BESTODDS_MIN_P || 0.4);
+const DEEP_MAX = Number(process.env.DEEP_MAX || 6);
+const DEEP_LOOKBACK = Number(process.env.DEEP_LOOKBACK || 3);
+const DEEP_WEIGHT = Number(process.env.DEEP_WEIGHT || 0.5);
+const DEEP_MAX_SHIFT = Number(process.env.DEEP_MAX_SHIFT || 0.06);
+const DEEP_LINEUPS = process.env.DEEP_LINEUPS !== 'off';
+const DEEP_WEATHER = process.env.DEEP_WEATHER !== 'off';
+
+// ---------- 1) which odds perform ----------
+const bandIdx = (o) => { for (let i = BAND_EDGES.length - 2; i >= 0; i--) if (o >= BAND_EDGES[i]) return i; return 0; };
+const bandLabel = (i) => (i === 0 ? `under ${BAND_EDGES[1].toFixed(2)}` : i === BAND_EDGES.length - 2 ? `${BAND_EDGES[i].toFixed(2)}+` : `${BAND_EDGES[i].toFixed(2)}–${(BAND_EDGES[i + 1] - 0.01).toFixed(2)}`);
+const SIDE_NAME = { H: 'Home win (1)', D: 'Draw (X)', A: 'Away win (2)', '1X': 'Home or Draw (1X)', X2: 'Away or Draw (X2)', '12': 'No draw (12)', GG: 'Both teams score (GG)', NG: 'Both NOT score (NG)' };
+
+// Every settled match becomes up to two flat 1-unit bets: the 1X2 pick as published (real average price) and, when it exists, the combo-market pick (fair price minus margin)
+function settledBets(pubOnly) {
+  const out = [];
+  for (const r of predLog) {
+    if (!r.res || !r.final) continue;
+    if (pubOnly && !(r.tags && r.tags.length)) continue;
+    const k = pickOf(r), o = pubOddsOf(r, k);
+    if (o && o > 1) out.push({ kind: 'x', k, odds: o, won: k === r.res, p: r.final[k], comp: r.comp });
+    if (r.cpick && r.codds > 1) {
+      const w = pickWon(r.cpick, r);
+      if (w != null) out.push({ kind: 'c', k: r.cpick, odds: r.codds, won: w, p: r.cp, comp: r.comp });
+    }
+  }
+  return out;
+}
+function betStats(bets) {
+  const n = bets.length, w = bets.filter((b) => b.won).length;
+  const profit = bets.reduce((s, b) => s + (b.won ? b.odds - 1 : -1), 0);
+  return {
+    n, w, rate: n ? w / n : null, profit, roi: n ? profit / n : null,
+    implied: n ? bets.reduce((s, b) => s + 1 / b.odds, 0) / n : 0,
+    // shrunk ROI: small samples are pulled toward the bookmaker margin, so 3 lucky wins cannot crown a price range
+    shrunk: (profit + BAND_PRIOR_N * BAND_PRIOR_ROI) / (n + BAND_PRIOR_N),
+  };
+}
+const verdictOf = (s) => (s.n < BAND_SOFT_MIN ? '⏳' : s.roi > 0 && s.rate >= s.implied ? '✅' : s.roi >= -0.05 ? '🟡' : '❌');
+const roiTxt = (s) => (s.roi == null ? 'n/a' : signed(s.roi * 100, 0) + '%');
+const statLine = (label, s) => `${verdictOf(s)} <b>${label}</b> · ${s.w}/${s.n} won (${pct(s.rate)}%) · odds imply ${pct(s.implied)}% · ROI ${roiTxt(s)}${s.n < BAND_MIN ? ' · 🔸 early' : ''}`;
+function groupBy(arr, keyFn) { const m = new Map(); for (const x of arr) { const k = keyFn(x); if (!m.has(k)) m.set(k, []); m.get(k).push(x); } return m; }
+function bandRows(xBets) { return [...groupBy(xBets, (b) => bandIdx(b.odds))].map(([i, arr]) => ({ i, label: bandLabel(i), ...betStats(arr) })).sort((a, b) => a.i - b.i); }
+
+const oddsNavKb = () => Markup.inlineKeyboard([[Markup.button.callback('📈 Best-odds picks', 'bestodds'), Markup.button.callback('🔬 Deep analysis', 'deep')]]);
+async function renderOddsCheck(u, pubOnly = false) {
+  await resolveLog().catch(() => {});
+  const all = settledBets(pubOnly);
+  const x = all.filter((b) => b.kind === 'x'), c = all.filter((b) => b.kind === 'c');
+  if (x.length < BAND_SOFT_MIN) return { text: `📊 <b>Odds check</b>\n\nOnly ${x.length} settled pick${x.length === 1 ? '' : 's'} in the log so far. I need at least ${BAND_SOFT_MIN} (ideally ${BAND_MIN}+ per price range) before the numbers mean anything. Keep using /top5, /best10 and /smart10 — every pick is logged and settled automatically.`, kb: oddsNavKb() };
+  const rows = bandRows(x);
+  let tx = `📊 <b>Odds check — which prices actually perform</b>\n<i>${pubOnly ? 'Published picks only' : 'Every analysed match'} · ${x.length} settled · flat 1-unit stake at the price logged when the pick was made</i>\n\n`;
+  tx += '🎚 <b>By odds range</b> (1X2 picks)\n';
+  for (const r of rows) tx += statLine(r.label, r) + '\n';
+  const eligible = rows.filter((r) => r.n >= BAND_MIN).sort((a, b) => b.shrunk - a.shrunk);
+  if (eligible.length) {
+    const top = eligible[0], low = eligible[eligible.length - 1];
+    tx += `\n🥇 Best range so far: <b>${top.label}</b> (ROI ${roiTxt(top)}, hit rate ${pct(top.rate)}% vs ${pct(top.implied)}% implied)\n`;
+    if (eligible.length > 1) tx += `🥶 Weakest range: <b>${low.label}</b> (ROI ${roiTxt(low)})\n`;
+    if (!eligible.some((r) => r.roi > 0)) tx += '⚠️ No price range is profitable yet — the bookmaker margin is still winning. Treat /bestodds as "least bad", and stake small.\n';
+  } else tx += `\n🔸 No range has ${BAND_MIN}+ settled picks yet, so nothing is ranked. Ranges with ${BAND_SOFT_MIN}+ are shown with an "early" flag.\n`;
+  const side = [...groupBy(x, (b) => b.k)].filter(([k]) => ['H', 'D', 'A'].includes(k));
+  if (side.length) {
+    tx += '\n🧭 <b>By pick type</b>\n';
+    for (const k of ['H', 'D', 'A']) { const e = side.find(([kk]) => kk === k); if (e) tx += statLine(SIDE_NAME[k], betStats(e[1])) + '\n'; }
+  }
+  if (c.length >= BAND_SOFT_MIN) {
+    tx += '\n🧩 <b>Combo markets</b> (Smart / 7-Day picks · priced at fair odds minus margin)\n';
+    const g = groupBy(c, (b) => b.k);
+    for (const k of ['H', 'A', '1X', 'X2', '12', 'GG', 'NG']) if (g.has(k) && g.get(k).length >= 3) tx += statLine(SIDE_NAME[k], betStats(g.get(k))) + '\n';
+  }
+  tx += '\n✅ profitable and beating the implied chance · 🟡 about break-even · ❌ losing · ⏳ too few · 🔸 small sample, can swing a lot.\n';
+  tx += '\n<i>Past performance of a price range is a hint, not a guarantee. Ranges are only compared with ' + BAND_MIN + '+ picks, and ROI is shrunk toward the bookmaker margin so a lucky streak cannot crown a range.</i>\n\n' + DISCLAIMER;
+  return { text: tx, kb: oddsNavKb() };
+}
+
+// ---------- 2) /bestodds : today's matches whose price falls in the best-performing odds ranges ----------
+async function renderBestOdds(u) {
+  await resolveLog().catch(() => {});
+  const rows = bandRows(settledBets(false).filter((b) => b.kind === 'x'));
+  let usable = rows.filter((r) => r.n >= BAND_MIN), early = false;
+  if (!usable.length) { usable = rows.filter((r) => r.n >= BAND_SOFT_MIN); early = true; }
+  const nav = Markup.inlineKeyboard([[Markup.button.callback('📊 Odds check', 'oddscheck'), Markup.button.callback('🏆 Top 5', 'top5')]]);
+  const settled = rows.reduce((s, r) => s + r.n, 0);
+  if (!usable.length) return { text: `📈 <b>Best-odds picks</b>\n\nNot enough history yet to know which odds ranges perform: ${settled} settled pick${settled === 1 ? '' : 's'} logged, and no price range has ${BAND_SOFT_MIN}+. Use /top5, /best10 and /smart10 for a few days so results build up, then come back. See /oddscheck for progress.\n\n` + t(u, 'disc'), kb: nav };
+  const chosen = [...usable].sort((a, b) => b.shrunk - a.shrunk).slice(0, BESTODDS_BANDS);
+  const bandMap = new Map(chosen.map((r) => [r.i, r]));
+  const pool0 = (await accaPool()).filter((z) => z.sc.pick.p >= BESTODDS_MIN_P && bandMap.has(bandIdx(z.sc.pick.odds)));
+  // rank = the bot's usual pick score + a small bonus for sitting in a range with a good record (capped, so the band never beats the match itself)
+  const ranked = pool0.map((z) => { const b = bandMap.get(bandIdx(z.sc.pick.odds)); return { ...z, band: b, rank: z.sc.score + 0.25 * Math.max(-0.12, Math.min(0.12, b.shrunk)) }; }).sort((a, b) => b.rank - a.rank);
+  if (!tagFrozen('bestodds')) ranked.slice(0, BESTODDS_COUNT).forEach((z) => logPrediction(z.m, z.st, 'bestodds')); // same list for everyone, so the section record stays honest
+  const shown = applyPrefs(ranked, u).slice(0, BESTODDS_COUNT);
+  let tx = '📈 <b>Best-odds picks</b>\n<i>Today\'s matches priced inside the odds ranges that have performed best in this bot\'s own settled results.</i>\n\n';
+  tx += '🎚 <b>Ranges used</b>\n' + chosen.map((r) => statLine(r.label, r)).join('\n') + '\n\n';
+  if (early) tx += '🔸 <b>Early data:</b> these ranges have fewer than ' + BAND_MIN + ' settled picks, so treat this as a lean, not a rule.\n\n';
+  if (!chosen.some((r) => r.roi > 0)) tx += '⚠️ None of these ranges is profitable yet — they are just the least bad so far.\n\n';
+  if (!shown.length) return { text: tx + `😴 No match today has a pick priced in ${chosen.map((r) => r.label).join(' or ')} with at least ${pct(BESTODDS_MIN_P)}% confidence${ranked.length ? ' inside your league / min-odds filters (see /settings)' : ''}. Check again later when more odds appear.\n\n` + sectionLine('bestodds') + t(u, 'disc'), kb: nav };
+  tx += FOLLOW_HINT;
+  shown.forEach(({ m, st, sc, band }, i) => {
+    const p = sc.pick;
+    tx += `${i + 1}. ${dotOf(p.p)} <b>${esc(m.home)} vs ${esc(m.away)}</b>\n   🕒 ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += `   👉 <b>${esc(p.label)}</b> (${p.sign}) @ ${p.odds.toFixed(2)}${bestPriceTxt(m, p.k)} · ${pct(p.p)}% confidence\n`;
+    tx += `   🎚 Range ${band.label}: ${band.w}/${band.n} won · ROI ${roiTxt(band)}\n`;
+    const r = reasonOf(m, st);
+    if (r) tx += `   <i>${esc(r)}</i>\n`;
+    tx += stakeTxt(u, p.p, m.odds.best ? m.odds.best[p.k] : p.odds) + '\n';
+  });
+  return { text: tx + sectionLine('bestodds') + t(u, 'disc'), kb: followKb(shown, nav) };
+}
+
+// ---------- 3) /deep : lineups, regular-XI check, pitch, weather, referee on top of the normal model ----------
+const espnSlugOf = (m) => m.slug || (String(m.comp).startsWith('X:') ? String(m.comp).slice(2) : FD_TO_ESPN[m.comp] || null);
+function espnSummaryRaw(slug, eventId, ttl = 10 * 60e3) {
+  return cached(`espnsum:${slug}:${eventId}`, ttl, async () => {
+    const qs = `event=${encodeURIComponent(eventId)}`;
+    let last = '';
+    for (const url of [`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/summary?${qs}`, `https://site.web.api.espn.com/apis/site/v2/sports/soccer/${slug}/summary?${qs}`]) {
+      try { const res = await fetchRetry(url, { headers: FEED_HEADERS }, 12000, 2); if (res.ok) return await res.json(); last = 'HTTP ' + res.status; } catch (e) { last = e.message; }
+    }
+    throw new Error(last || 'summary failed');
+  });
+}
+async function espnEventFor(m) {
+  const key = 'espnev:' + m.id;
+  const r = await cached(key, 6 * 3600e3, async () => {
+    const slug = espnSlugOf(m);
+    if (!slug) return null;
+    const same = (names, full, short) => names.some((n) => n && (nameScore(n, full) >= 0.99 || nameScore(n, short) >= 0.99));
+    for (const d of [ymd(m.utc), ymd(m.utc - 864e5), ymd(m.utc + 864e5)]) {
+      try {
+        const data = await espnJson(slug, d);
+        const ev = (data.events || []).find((e) => {
+          const comp = (e.competitions || [])[0];
+          const h = comp && (comp.competitors || []).find((c) => c.homeAway === 'home');
+          const a = comp && (comp.competitors || []).find((c) => c.homeAway === 'away');
+          return h && a && h.team && a.team && same([h.team.displayName, h.team.shortDisplayName], m.homeFull, m.home) && same([a.team.displayName, a.team.shortDisplayName], m.awayFull, m.away);
+        });
+        if (ev) return { slug, id: String(ev.id) };
+      } catch {}
+    }
+    if (m.extra && m.id > 9e12 && m.id < 9e12 + 1e8) return { slug, id: String(m.id - 9e12) }; // ESPN-sourced fixtures carry the event id inside m.id
+    return null;
+  });
+  if (!r) cache.delete(key); // do not remember a miss for hours
+  return r;
+}
+function espnTeamEvents(slug, teamId) { // completed events with ids (the older espnTeamGames keeps only scores)
+  return cached(`espnteamev:${slug}:${teamId}`, 6 * 3600e3, async () => {
+    let data = null;
+    for (const url of [`https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${teamId}/schedule`, `https://site.web.api.espn.com/apis/site/v2/sports/soccer/${slug}/teams/${teamId}/schedule`]) {
+      const res = await fetchRetry(url, { headers: FEED_HEADERS }, 12000, 2);
+      if (res.ok) { data = await res.json(); break; }
+    }
+    if (!data) throw new Error('schedule unavailable');
+    return (data.events || []).filter((ev) => { const comp = (ev.competitions || [])[0]; const s = comp && ((comp.status || ev.status || {}).type) || {}; return s.completed === true || s.state === 'post'; })
+      .map((ev) => ({ id: String(ev.id), date: ev.date })).sort((a, b) => new Date(b.date) - new Date(a.date));
+  });
+}
+function posGroup(pos) { // ESPN position codes: G, CD-L, LB, CM-R, DM, AM, LW, CF-L ...
+  const p = String(pos || '').toUpperCase();
+  if (/^G/.test(p)) return 'G';
+  if (/^(CDM|DM|CAM|AM|CM|[LR]M|M)/.test(p)) return 'M';
+  if (/^(CD|CB|SW|[LR]?WB|[LR]B|DF?$|DEF)/.test(p)) return 'D';
+  if (/^(CF|ST|SS|[LR]?[FW]|F)/.test(p)) return 'F';
+  return 'M';
+}
+const GROUP_NAME = { G: 'GK', D: 'DEF', M: 'MID', F: 'FWD' };
+function parseRoster(r) {
+  const list = (r.roster || []).map((p) => {
+    const a = p.athlete || {};
+    const pos = (p.position && (p.position.abbreviation || p.position.displayName)) || (a.position && (a.position.abbreviation || a.position.displayName)) || '';
+    return { key: String(a.id || a.displayName || a.fullName || ''), name: a.displayName || a.fullName || a.shortName || '', pos: String(pos), starter: !!p.starter };
+  }).filter((p) => p.key && p.name);
+  return { formation: r.formation || null, all: list, starters: list.filter((p) => p.starter) };
+}
+async function sideLineup(slug, teamId, rosterObj, kickoff) {
+  const ro = rosterObj ? parseRoster(rosterObj) : null;
+  const announced = !!(ro && ro.starters.length >= 10);
+  let core = [], games = 0;
+  if (teamId) {
+    const evs = (await espnTeamEvents(slug, teamId).catch(() => [])).filter((e) => new Date(e.date).getTime() < kickoff).slice(0, DEEP_LOOKBACK);
+    const sets = (await pool(evs, 2, async (e) => {
+      try {
+        const sum = await espnSummaryRaw(slug, e.id, 6 * 3600e3);
+        const r = (sum.rosters || []).find((x) => String(x.team && x.team.id) === String(teamId));
+        const s = r ? parseRoster(r).starters : [];
+        return s.length >= 10 ? s : null;
+      } catch { return null; }
+    })).filter(Boolean);
+    games = sets.length;
+    if (sets.length >= 2) {
+      const need = Math.ceil(sets.length * 0.66), cnt = new Map();
+      sets.forEach((s) => s.forEach((p) => { const e = cnt.get(p.key) || { n: 0, p }; e.n++; cnt.set(p.key, e); }));
+      core = [...cnt.values()].filter((e) => e.n >= need).map((e) => e.p);
+    }
+  }
+  let missing = [];
+  if (announced && core.length) {
+    const xi = new Set(ro.starters.map((p) => p.key)), squad = new Set(ro.all.map((p) => p.key));
+    missing = core.filter((p) => !xi.has(p.key)).map((p) => ({ ...p, status: squad.has(p.key) ? 'on the bench' : 'not in the squad' }));
+  }
+  return { formation: ro && ro.formation, announced, xi: ro ? ro.starters : [], core, missing, games };
+}
+async function weatherAt(city, utc) { // Open-Meteo (free, no key): forecast near the venue's city at kickoff
+  if (!DEEP_WEATHER || !city || utc - Date.now() > 14 * 864e5) return null;
+  return cached(`wx:${city}:${new Date(utc).toISOString().slice(0, 13)}`, 3 * 3600e3, async () => {
+    const g = await fetchRetry(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`, { headers: FEED_HEADERS }, 8000, 2);
+    if (!g.ok) throw new Error('geocoding HTTP ' + g.status);
+    const loc = ((await g.json()).results || [])[0];
+    if (!loc) return null;
+    const day = new Date(utc).toISOString().slice(0, 10);
+    const w = await fetchRetry(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&hourly=temperature_2m,precipitation,wind_speed_10m&start_date=${day}&end_date=${day}&timezone=UTC`, { headers: FEED_HEADERS }, 8000, 2);
+    if (!w.ok) throw new Error('forecast HTTP ' + w.status);
+    const h = (await w.json()).hourly;
+    if (!h || !h.time) return null;
+    const d = new Date(utc), i = Math.min(h.time.length - 1, d.getUTCHours() + (d.getUTCMinutes() >= 30 ? 1 : 0));
+    return { place: loc.name, temp: h.temperature_2m[i], rain: h.precipitation[i], wind: h.wind_speed_10m[i] };
+  });
+}
+async function deepFetch(m) {
+  const out = { ok: false, venue: null, city: null, grass: null, referee: null, espnWx: null, wx: null, H: null, A: null };
+  const ev = await espnEventFor(m).catch(() => null);
+  if (!ev) return out;
+  let sum;
+  try { sum = await espnSummaryRaw(ev.slug, ev.id); } catch { return out; }
+  out.ok = true;
+  const gi = sum.gameInfo || {};
+  const comp = (sum.header && sum.header.competitions && sum.header.competitions[0]) || {};
+  const v = gi.venue || comp.venue || null;
+  if (v) { out.venue = v.fullName || null; out.city = (v.address && v.address.city) || null; out.grass = typeof v.grass === 'boolean' ? v.grass : null; }
+  const offs = gi.officials || [];
+  const ref = offs.find((o) => /^referee$/i.test(String((o.position && (o.position.displayName || o.position.name)) || ''))) || offs[0];
+  out.referee = (ref && (ref.displayName || ref.fullName)) || null;
+  if (gi.weather && (gi.weather.displayValue || gi.weather.temperature != null)) out.espnWx = [gi.weather.displayValue, gi.weather.temperature != null ? gi.weather.temperature + '°' : ''].filter(Boolean).join(' ');
+  const idOf = (ha) => { const c = (comp.competitors || []).find((x) => x.homeAway === ha); return c && ((c.team && c.team.id) || c.id); };
+  const rosterOf = (ha) => (sum.rosters || []).find((r) => r.homeAway === ha);
+  const tid = (ha, fb) => idOf(ha) || (rosterOf(ha) && rosterOf(ha).team && rosterOf(ha).team.id) || fb;
+  const [wx, H, A] = await Promise.all([
+    weatherAt(out.city, m.utc).catch(() => null),
+    DEEP_LINEUPS ? sideLineup(ev.slug, tid('home', m.espnHomeId), rosterOf('home'), m.utc).catch(() => null) : null,
+    DEEP_LINEUPS ? sideLineup(ev.slug, tid('away', m.espnAwayId), rosterOf('away'), m.utc).catch(() => null) : null,
+  ]);
+  out.wx = wx; out.H = H; out.A = A;
+  return out;
+}
+// Adjustment sizes are deliberately small and capped: bookmaker prices (especially close to kickoff) already include much of this news.
+const ATK_COST = { G: 0, D: 0.005, M: 0.015, F: 0.03 };   // attack lost per missing regular starter
+const DEF_COST = { G: 0.04, D: 0.02, M: 0.008, F: 0 };    // extra goals conceded per missing regular starter
+function lineupFactors(side) {
+  if (!side || !side.announced) return { atk: 1, concede: 1 };
+  let a = 0, d = 0;
+  for (const p of side.missing) { const g = posGroup(p.pos); a += ATK_COST[g]; d += DEF_COST[g]; }
+  return { atk: 1 - Math.min(a, 0.1), concede: 1 + Math.min(d, 0.1) };
+}
+function weatherFactor(w) {
+  if (!w) return { f: 1, tags: [] };
+  let f = 1; const tags = [];
+  if (w.rain >= 1.5) { f -= 0.04; tags.push('heavy rain'); } else if (w.rain >= 0.5) { f -= 0.015; tags.push('rain'); }
+  if (w.wind >= 35) { f -= 0.05; tags.push('strong wind'); } else if (w.wind >= 25) { f -= 0.02; tags.push('windy'); }
+  if (w.temp >= 32) { f -= 0.03; tags.push('extreme heat'); }
+  return { f: Math.max(0.9, f), tags };
+}
+function deepPredict(m, st, d) {
+  if (!st || !st.final) return null;
+  const base = st.form && Number.isFinite(st.form.lh) ? { lh: st.form.lh, la: st.form.la } : fitLambdas(st.final);
+  const fH = lineupFactors(d.H), fA = lineupFactors(d.A), wf = weatherFactor(d.wx);
+  const pitch = d.grass === false ? { h: 1.02, a: 0.98 } : { h: 1, a: 1 }; // artificial turf: small home edge
+  const cl = (x) => Math.max(0.75, Math.min(1.25, x));
+  const lh2 = base.lh * cl(fH.atk * fA.concede * wf.f * pitch.h);
+  const la2 = base.la * cl(fA.atk * fH.concede * wf.f * pitch.a);
+  const b0 = poisson1x2(base.lh, base.la), b1 = poisson1x2(lh2, la2);
+  const raw = {}; let tot = 0;
+  for (const k of ['H', 'D', 'A']) {
+    const shift = Math.max(-DEEP_MAX_SHIFT, Math.min(DEEP_MAX_SHIFT, (b1[k] - b0[k]) * DEEP_WEIGHT));
+    raw[k] = Math.max(0.01, st.final[k] + shift); tot += raw[k];
+  }
+  const final2 = { H: raw.H / tot, D: raw.D / tot, A: raw.A / tot };
+  return { lh0: base.lh, la0: base.la, lh2, la2, final0: st.final, final2, mk0: poissonMarkets(base.lh, base.la), mk2: poissonMarkets(lh2, la2), fH, fA, wf, pitch, hasForm: !!st.form };
+}
+function depthOf(d, st) {
+  const items = [
+    ['lineups', !!(d.H && d.H.announced && d.A && d.A.announced)],
+    ['regular-XI check', !!(d.H && d.H.core.length && d.A && d.A.core.length && d.H.announced && d.A.announced)],
+    ['injury feed', !!(st && st.inj)],
+    ['venue / pitch', !!d.venue],
+    ['weather', !!d.wx],
+    ['referee', !!d.referee],
+  ];
+  return { n: items.filter((x) => x[1]).length, total: items.length, text: items.map(([k, ok]) => `${ok ? '✅' : '▫️'} ${k}`).join(' · ') };
+}
+function deepMarket(m, st, dp) {
+  return marketPick(m, { ...st, final: dp.final2, mk: dp.mk2, form: st.form ? { ...st.form, lh: dp.lh2, la: dp.la2 } : { lh: dp.lh2, la: dp.la2 } });
+}
+function logDeep(m, st, d, dp) {
+  if (!m.odds || !dp || m.utc <= Date.now()) return;
+  logPrediction(m, st); // base probabilities stay untouched, so the other sections' records are not polluted
+  const r = predById.get(m.id);
+  const known = !!(d.H && d.H.announced && d.A && d.A.announced);
+  if (!r || r.res || (r.dpick && r.dlineup && !known)) return; // keep the version made WITH lineups
+  const pk = topPick(m, dp.final2), mp = deepMarket(m, st, dp);
+  if (!pk) return;
+  r.dpick = pk.k; r.dp = pk.p; r.dodds = pk.odds; r.dlineup = known;
+  if (mp) { r.dmk = mp.k; r.dmp = mp.p; r.dmodds = mp.fair ? Math.max(1.01, +(mp.odds * (1 - COMBO_MARGIN)).toFixed(2)) : mp.odds; } else { r.dmk = r.dmp = r.dmodds = undefined; }
+  predDirty.add(r.id); savePredLog();
+}
+function deepRecord(days = 60) {
+  const since = Date.now() - days * 864e5;
+  const rows = predLog.filter((r) => r.dpick && r.res && r.utc >= since);
+  if (rows.length < 5) return '';
+  const lean = (arr) => { let w = 0, pr = 0, pn = 0; for (const r of arr) { const win = r.dpick === r.res; if (win) w++; if (r.dodds) { pn++; pr += win ? r.dodds - 1 : -1; } } return { n: arr.length, w, roi: pn >= 5 ? pr / pn : null }; };
+  const L = lean(rows);
+  const mk = rows.filter((r) => r.dmk).map((r) => ({ w: pickWon(r.dmk, r), o: r.dmodds })).filter((x) => x.w != null);
+  let tx = `📊 <b>Deep-pick record · last ${days} days:</b> 1X2 lean ${L.w}/${L.n} (${pct(L.w / L.n)}%)` + (L.roi != null ? ` · ROI ${signed(L.roi * 100, 0)}%` : '');
+  if (mk.length >= 5) tx += ` · market pick ${mk.filter((x) => x.w).length}/${mk.length} (${pct(mk.filter((x) => x.w).length / mk.length)}%)`;
+  const withL = rows.filter((r) => r.dlineup), noL = rows.filter((r) => !r.dlineup);
+  if (withL.length >= 5 && noL.length >= 5) tx += `\n   with confirmed lineups ${lean(withL).w}/${withL.length} vs without ${lean(noL).w}/${noL.length}`;
+  return tx + '\n\n';
+}
+const sgn = (x) => (x >= 0 ? '+' : '−') + Math.abs(x * 100).toFixed(1) + '%';
+const hda3 = (f) => `${pct(f.H)}/${pct(f.D)}/${pct(f.A)}`;
+function adjustNotes(m, dp) {
+  const n = [];
+  for (const [name, f] of [[m.home, dp.fH], [m.away, dp.fA]]) {
+    if (f.atk < 0.9995) n.push(`${esc(name)} attack ${sgn(f.atk - 1)}`);
+    if (f.concede > 1.0005) n.push(`${esc(name)} concede ${sgn(f.concede - 1)}`);
+  }
+  if (dp.wf.tags.length) n.push(`weather (${dp.wf.tags.join(', ')}) goals ${sgn(dp.wf.f - 1)}`);
+  if (dp.pitch.h !== 1) n.push('artificial turf: small home edge');
+  return n;
+}
+function lineupLine(m, d) {
+  if (!d.ok) return '📋 Lineups: no ESPN match page found for this fixture.\n';
+  const part = (name, s) => (!s ? `${esc(name)}: n/a` : s.announced ? `${esc(name)} ${s.formation ? esc(s.formation) + ' ' : ''}✅` : `${esc(name)} ⏳ not announced`);
+  return `📋 <b>Lineups:</b> ${part(m.home, d.H)} · ${part(m.away, d.A)}\n`;
+}
+function missingText(m, d) {
+  let tx = '';
+  for (const [name, s] of [[m.home, d.H], [m.away, d.A]]) {
+    if (!s || !s.announced) continue;
+    if (!s.core.length) { tx += `   ${esc(name)}: regular XI unknown (need ${2}+ recent games)\n`; continue; }
+    tx += s.missing.length ? `   ${esc(name)} — regular starters out of the XI: ${s.missing.map((p) => `${esc(p.name)} (${GROUP_NAME[posGroup(p.pos)]}, ${p.status})`).join(', ')}\n` : `   ${esc(name)} — all regular starters are playing\n`;
+  }
+  return tx ? '🔄 <b>Regular-XI check</b>\n' + tx : '';
+}
+function venueLine(d) {
+  const bits = [];
+  if (d.venue) bits.push(`🏟 ${esc(d.venue)}${d.city ? ' (' + esc(d.city) + ')' : ''}`);
+  if (d.grass === true) bits.push('🌱 natural grass'); else if (d.grass === false) bits.push('🧱 artificial turf');
+  if (d.referee) bits.push(`🧑‍⚖️ ${esc(d.referee)}`);
+  let tx = bits.length ? bits.join(' · ') + '\n' : '';
+  if (d.wx) tx += `🌦 Forecast at kickoff near ${esc(d.wx.place)}: ${Math.round(d.wx.temp)}°C · rain ${d.wx.rain.toFixed(1)} mm/h · wind ${Math.round(d.wx.wind)} km/h\n`;
+  else if (d.espnWx) tx += `🌦 Weather: ${esc(d.espnWx)}\n`;
+  return tx;
+}
+
+async function renderDeepMatch(m, u) {
+  const base = bestKnown(m, await deepAnalysis(m));
+  const st = await aiRefine(m, base).catch(() => base);
+  const d = await deepFetch(m).catch(() => ({ ok: false }));
+  const dp = deepPredict(m, st, d);
+  logDeep(m, st, d, dp);
+  let tx = `🔬 <b>Deep analysis</b>\n<b>${esc(m.home)} vs ${esc(m.away)}</b>\n🏆 ${esc(m.compName)} · 🕒 ${fmtDate(m.utc)} ${fmtTime(m.utc)}\n\n`;
+  tx += venueLine(d) + lineupLine(m, d);
+  if (d.H && d.H.announced && d.H.xi.length >= 10) tx += `   ${esc(m.home)} XI: ${d.H.xi.map((p) => esc(p.name.split(' ').slice(-1)[0])).join(', ')}\n`;
+  if (d.A && d.A.announced && d.A.xi.length >= 10) tx += `   ${esc(m.away)} XI: ${d.A.xi.map((p) => esc(p.name.split(' ').slice(-1)[0])).join(', ')}\n`;
+  tx += missingText(m, d);
+  tx += injText(m, st.inj);
+  if (!dp) return { text: tx + '\nNot enough odds / form data to model this match.\n\n' + t(u, 'disc'), kb: oddsNavKb() };
+  const notes = adjustNotes(m, dp);
+  tx += '\n⚙️ <b>Adjustments</b>: ' + (notes.length ? notes.join(' · ') : 'none — nothing in the extra data moves the model') + '\n';
+  tx += `\n🔮 <b>Probabilities</b> (H/D/A)\n   Standard model: ${hda3(dp.final0)}\n   With deep data: <b>${hda3(dp.final2)}</b>\n`;
+  tx += `⚽ Expected goals ${dp.lh0.toFixed(2)}–${dp.la0.toFixed(2)} → <b>${dp.lh2.toFixed(2)}–${dp.la2.toFixed(2)}</b> · likeliest ${dp.mk2.score} · O2.5 ${pct(dp.mk0.over25)}% → ${pct(dp.mk2.over25)}% · BTTS ${pct(dp.mk0.btts)}% → ${pct(dp.mk2.btts)}%\n`;
+  const pk = topPick(m, dp.final2), mp = m.odds ? deepMarket(m, st, dp) : null;
+  if (pk) tx += `\n👉 <b>1X2 lean:</b> ${esc(pk.label)} (${pk.sign})${pk.odds ? ` @ ${pk.odds.toFixed(2)}` : ''} · ${pct(pk.p)}%\n`;
+  if (mp) tx += `🛡 <b>Safest market:</b> ${esc(mp.label)} (${mp.sign}) ${oddsTxt(mp)} · ${pct(mp.p)}%\n`;
+  const dep = depthOf(d, st);
+  tx += `\n📶 <b>Data depth ${dep.n}/${dep.total}:</b> ${dep.text}\n`;
+  if (!(d.H && d.H.announced)) tx += '⏳ <i>Lineups usually appear 60–75 min before kickoff — run /deep again then; this is the version that gets tracked.</i>\n';
+  tx += '\n<i>Adjustments are small and capped (bookmaker odds already price much of this news). Missing "regular starters" are judged from each team\'s last ' + DEEP_LOOKBACK + ' starting XIs; no referee or pitch-quality stats are modelled — those are shown for context only.</i>\n\n';
+  tx += deepRecord() + t(u, 'disc');
+  const rows = [[Markup.button.callback('⭐ Watch', `w:${m.id}`), Markup.button.callback('🔄 Refresh', `dp:${m.id}`)]];
+  return { text: tx, kb: Markup.inlineKeyboard(rows) };
+}
+
+async function renderDeepList(u) {
+  const cands = applyPrefs(await accaPool(), u).sort((a, b) => b.sc.score - a.sc.score).slice(0, DEEP_MAX * 2)
+    .sort((a, b) => a.m.utc - b.m.utc).slice(0, DEEP_MAX); // soonest kickoffs first: they are the ones with lineups
+  const nav = Markup.inlineKeyboard([[Markup.button.callback('📈 Best-odds picks', 'bestodds'), Markup.button.callback('📊 Odds check', 'oddscheck')]]);
+  if (!cands.length) return { text: '🔬 <b>Deep analysis</b>\n\n😴 No upcoming match with usable odds right now. Try again later, or use <code>/deep Arsenal Chelsea</code> for a specific match.\n\n' + t(u, 'disc'), kb: nav };
+  const res = await pool(cands, 2, async ({ m, st }) => {
+    const d = await deepFetch(m).catch(() => ({ ok: false }));
+    const dp = deepPredict(m, st, d);
+    logDeep(m, st, d, dp);
+    return { m, st, d, dp };
+  });
+  let tx = '🔬 <b>Deep analysis — today\'s strongest matches</b>\n<i>Normal model + confirmed lineups, regular-XI check, pitch and weather. Tap a number for the full report.</i>\n\n';
+  res.forEach(({ m, st, d, dp }, i) => {
+    tx += `${i + 1}. <b>${esc(m.home)} vs ${esc(m.away)}</b> · ${fmtTime(m.utc)} · ${esc(m.compName)}\n`;
+    tx += '   ' + lineupLine(m, d).replace(/^📋 <b>Lineups:<\/b> /, '📋 ');
+    if (!dp) { tx += '   ⚠️ not enough data to model\n\n'; return; }
+    const notes = adjustNotes(m, dp);
+    if (notes.length) tx += `   ⚙️ ${notes.join(' · ')}\n`;
+    tx += `   📊 H/D/A ${hda3(dp.final0)} → <b>${hda3(dp.final2)}</b> · xG ${dp.lh2.toFixed(1)}–${dp.la2.toFixed(1)}\n`;
+    const pk = topPick(m, dp.final2), mp = deepMarket(m, st, dp);
+    if (pk) tx += `   👉 ${esc(pk.label)} (${pk.sign})${pk.odds ? ` @ ${pk.odds.toFixed(2)}` : ''} · ${pct(pk.p)}%` + (mp && mp.k !== pk.k ? ` · 🛡 ${esc(mp.label)} ${pct(mp.p)}%` : '') + '\n';
+    tx += `   📶 depth ${depthOf(d, st).n}/6\n\n`;
+  });
+  tx += deepRecord() + t(u, 'disc');
+  const btns = res.map((x, i) => Markup.button.callback(`🔬 ${i + 1}`, `dp:${x.m.id}`));
+  const rows = [];
+  for (let i = 0; i < btns.length; i += 5) rows.push(btns.slice(i, i + 5));
+  return { text: tx, kb: Markup.inlineKeyboard([...rows, ...nav.reply_markup.inline_keyboard]) };
+}
+async function renderDeep(u, query) {
+  if (!query) return renderDeepList(u);
+  const m = await findFixture(query);
+  if (!m) return `🔎 No fixture found for “${esc(query)}” in the next 7 days. Try the team name as it appears in /today.`;
+  return renderDeepMatch(m, u);
+}
+
+bot.command(['oddscheck', 'odds'], detach(toolHandler((ctx) => renderOddsCheck(ctx.u, /pub/i.test(argText(ctx))))));
+bot.action('oddscheck', async (ctx) => { await ctx.answerCbQuery().catch(() => {}); toolHandler((c) => renderOddsCheck(c.u, false))(ctx).catch(console.error); });
+bot.action(/^dp:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!ctx.premium) return paywall(ctx, '🔒 <b>Deep analysis</b> is a Premium feature.');
+  const m = await findMatchAny(Number(ctx.match[1]));
+  if (!m) return void (await reply(ctx, 'Match not found (list refreshed). Use /deep again.'));
+  toolHandler((c) => renderDeepMatch(m, c.u))(ctx).catch(console.error);
+});
+
 // ----- new Premium tools (+ button handlers for the existing goals / dc) -----
 const PREM_TOOLS = {
   best10pro: ['🔟⭐ Best 10 Pro', (c) => renderBest10Pro(c.u)],
@@ -5530,6 +5984,8 @@ const PREM_TOOLS = {
   weekend: ['🏖 Weekend special', (c) => renderWeekend(c.u)],
   goals: ['⚽ Goals markets', (c) => renderGoals(c.u)],
   dc: ['🛡 Double chance', (c) => renderDC(c.u)],
+  bestodds: ['📈 Best-odds picks', (c) => renderBestOdds(c.u)],
+  deep: ['🔬 Deep analysis', (c) => renderDeep(c.u, argText(c))],
 };
 for (const [name, [label, fn]] of Object.entries(PREM_TOOLS)) {
   const h = toolHandler(fn);
@@ -5801,6 +6257,9 @@ const PUBLIC_COMMANDS = [ // the "/" menu shows categories only; every other com
   { command: 'picks', description: '🔥 Daily picks: Best 10, Top 5, Best 3, Smart…' },
   { command: 'week', description: '📅 7-day picks: 2 per day, 70%+ chance' },
   { command: 'vip', description: '👑 VIP special: most likely winners today' },
+  { command: 'bestodds', description: '📈 Picks in the odds ranges that perform best' },
+  { command: 'deep', description: '🔬 Deep analysis: lineups, pitch, weather' },
+  { command: 'oddscheck', description: '📊 Which odds ranges actually win' },
   { command: 'matches', description: '⚽ Matches: today, tomorrow, live, tables' },
   { command: 'markets', description: '📈 Markets: value, goals, HT/FT, combos…' },
   { command: 'accas', description: '🎯 Accumulators: builder, safe slip, weekend' },
